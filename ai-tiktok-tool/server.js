@@ -1300,7 +1300,11 @@ function serveStatic(req, res) {
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "application/octet-stream" });
+    const headers = { "Content-Type": mimeTypes[ext] || "application/octet-stream" };
+    if ([".html", ".css", ".js"].includes(ext)) {
+      headers["Cache-Control"] = "no-store, max-age=0";
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 }
