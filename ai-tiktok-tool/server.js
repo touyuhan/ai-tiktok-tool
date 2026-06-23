@@ -733,6 +733,8 @@ function buildPrompt(input) {
         "根据产品名称、核心卖点、卖点/促销信息、使用场景、目标人群、目标国家、指定语言、竞品备注推导。",
         "productInput.rawCoreSellingPoints 是必须在后续口播中讲到的核心卖点，生成 sellingPoints 时必须优先保留并标为主项。",
         "productInput.rawSellingPoints 是补充卖点/促销信息/规格/套装/价格优势，用来扩展卖点池、CTA 和值感表达。",
+        "productInput.referenceCopies 最多 3 条，是用户提供的参考文案。需要学习其开头 hook、卖点叠加顺序、情绪/网感、CTA 强度和句式节奏，但不得直接照抄原句。",
+        "如果参考文案里有明显的高转化表达结构，要在 planStrategies 的 angle、competitorAnalysis 的 hook/sellingExpression/cta 中吸收其结构。",
         "目标人群和痛点要服务于每条生成方案，允许部分重复，但不要无依据乱写。",
         "planStrategies 数量必须等于 planCount，最多 10 条。",
         "如果用户选择了风格，优先使用 selectedStyles；如果没选，从风格库自动组合。",
@@ -767,6 +769,7 @@ function buildPrompt(input) {
 }
 
 function buildCopyPrompt(input) {
+  const confirmedCopyBrief = buildConfirmedCopyBrief(input);
   return JSON.stringify(
     {
       task: "根据已确认的卖点、人群、痛点、场景和方案策略卡，生成 12-30 秒 TikTok 带货口播文案。",
@@ -785,22 +788,111 @@ function buildCopyPrompt(input) {
         "voiceover 使用 productInput.outputLanguage 对应语言。",
         "voiceoverZh 是自然中文翻译。",
         "editedZh 初始等于 voiceoverZh，供用户后续微调。",
-        "每条文案必须优先覆盖 productInput.rawCoreSellingPoints 里的核心卖点，不得遗漏用户明确填写的核心卖点。",
-        "除核心卖点外，尽可能从 aiAnalysis.sellingPoints 和 productInput.rawSellingPoints 中自然叠加 3-6 个卖点/场景/规格/价格优势，形成“太值了”的感觉。",
+        "如果 productInput.referenceCopies 有内容，必须学习参考文案的 hook 类型、句子节奏、卖点叠加方式、CTA 力度和网感表达，但不能复制原句或只替换产品名。",
+        "参考文案只作为表达结构和转化方式的学习样本；必须重新结合当前产品、目标人群、目标国家和核心卖点生成新文案。",
+        "confirmedCopyBrief 是用户在第二屏确认/修改后的最终文案生成依据，必须优先于第一页原始输入。",
+        "每条文案必须基于 confirmedCopyBrief.perPlanBriefs 中对应方案生成，不得脱离第二屏确认后的风格、人群、痛点、场景和卖点池。",
+        "每条文案必须优先覆盖 confirmedCopyBrief.requiredCoreSellingPoints，不得遗漏用户明确填写或第二屏标为主项的核心卖点。",
+        "每条文案必须使用对应 perPlanBrief.mustMentionSellingPoints 和 perPlanBrief.valueStack；如果 valueStack 超过 5 个，至少自然讲到 4 个。",
+        "除核心卖点外，必须从补充卖点、使用场景、规格、价格优势或促销信息中继续叠加，形成“太值了”的感觉。",
         "卖点叠加要像真实 TikTok 口播，不要机械罗列；可以用短句、并列句、场景化表达把多个卖点连起来。",
-        "如果 productInput.rawSellingPoints 中包含具体促销、套装、折扣、赠品、低价、买几件更划算等信息，结尾 CTA 必须使用这些具体信息。",
+        "如果 confirmedCopyBrief.promotionInfo 中包含具体促销、套装、折扣、赠品、低价、买几件更划算等信息，结尾 CTA 必须使用这些具体信息。",
         "如果用户没有提供明确促销信息，结尾可以使用宽泛但自然的活动说法，例如“现在卖家在做活动”“现在入手更划算”“趁活动还在先加购物车”。",
         "不得用“马来西亚人/大马人/新加坡人/本地人”等标签式称呼来假装本土化，除非用户明确要求。",
         "优先使用目标语言里自然的口语连接词、购买表达、促销表达和生活化说法，让当地用户听起来像真实 TikTok 内容。",
         "不要使用宗教敏感表达，不要夸张承诺除菌、治病、永久除味。",
         "结尾必须给现在买的理由，例如优惠、套装更划算、多空间使用、限时库存等。",
       ],
+      confirmedCopyBrief,
       productInput: input.productInput,
       aiAnalysis: input.aiAnalysis,
     },
     null,
     2
   );
+}
+
+function buildConfirmedCopyBrief(input) {
+  const productInput = input.productInput || {};
+  const aiAnalysis = input.aiAnalysis || {};
+  const confirmedSellingPoints = (aiAnalysis.sellingPoints || []).map((point, index) => ({
+    title: point.title || "",
+    description: point.description || "",
+    isPrimary: Boolean(point.isPrimary),
+    order: index + 1,
+  }));
+  const primaryConfirmedSellingPoints = confirmedSellingPoints
+    .filter((point) => point.isPrimary)
+    .flatMap((point) => [point.title, point.description])
+    .filter(Boolean);
+  const requiredCoreSellingPoints = uniqueItems([
+    ...splitLocal(productInput.rawCoreSellingPoints),
+    ...primaryConfirmedSellingPoints,
+  ]);
+  const userSellingAndPromoPoints = splitLocal(productInput.rawSellingPoints);
+  const confirmedSellingPointTexts = confirmedSellingPoints
+    .flatMap((point) => [point.title, point.description])
+    .filter(Boolean);
+  const confirmedUseCases = (aiAnalysis.useCases || []).map((item) => item.scene).filter(Boolean);
+  const confirmedAudiences = (aiAnalysis.audiences || []).map((item) => item.name || item.motivation).filter(Boolean);
+  const confirmedPainPoints = (aiAnalysis.painPoints || []).map((item) => item.pain).filter(Boolean);
+  const promotionInfo = userSellingAndPromoPoints.filter((point) =>
+    /促销|优惠|折扣|活动|买|送|包邮|低价|便宜|划算|套装|赠品|price|sale|promo|discount/i.test(point)
+  );
+  const baseValueStack = uniqueItems([
+    ...requiredCoreSellingPoints,
+    ...userSellingAndPromoPoints,
+    ...confirmedSellingPointTexts,
+    ...confirmedUseCases.map((scene) => `可用于${scene}`),
+  ]).slice(0, 10);
+
+  return {
+    source: "second_screen_confirmed_aiAnalysis",
+    instruction: "先整合第二屏卖点确认结果，再按文案结构生成口播。",
+    confirmedSellingPoints,
+    confirmedAudiences,
+    confirmedPainPoints,
+    confirmedUseCases,
+    requiredCoreSellingPoints,
+    supplementarySellingPoints: uniqueItems([...userSellingAndPromoPoints, ...confirmedSellingPointTexts]).slice(0, 12),
+    promotionInfo,
+    referenceCopyLearningTargets: (productInput.referenceCopies || []).slice(0, 3).map((copy, index) => ({
+      index: index + 1,
+      learn: "学习 hook、句子节奏、卖点叠加方式和 CTA 力度，不复制原句。",
+      text: copy,
+    })),
+    perPlanBriefs: (aiAnalysis.planStrategies || []).map((plan, index) => {
+      const rotated = rotateItems(baseValueStack, index).slice(0, Math.min(6, Math.max(4, baseValueStack.length)));
+      return {
+        planNo: plan.planNo || index + 1,
+        style: plan.style || "",
+        audience: plan.audience || "",
+        painPoint: plan.painPoint || "",
+        scene: plan.scene || "",
+        hookGoal: "开头用目标人群或痛点让用户愿意继续看。",
+        buyGoal: "中段用确认后的卖点池做值感堆叠，让用户觉得值得买。",
+        ctaGoal: promotionInfo.length ? "结尾使用用户提供的促销/价格/套装信息催单。" : "结尾使用宽泛但自然的活动理由催单。",
+        mustMentionSellingPoints: requiredCoreSellingPoints,
+        valueStack: rotated,
+        ctaSource: promotionInfo.length ? promotionInfo : ["现在卖家在做活动", "现在入手更划算", "趁活动还在先加购物车"],
+        writingInstruction:
+          "严格按“吸引目标群体注意开头 + 卖点叠加 + 呼吁下单”生成；中段必须围绕 valueStack 做自然口播式卖点叠加，不要像项目符号。",
+      };
+    }),
+  };
+}
+
+function uniqueItems(items) {
+  return items
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index);
+}
+
+function rotateItems(items, offset) {
+  if (!items.length) return [];
+  const start = offset % items.length;
+  return [...items.slice(start), ...items.slice(0, start)];
 }
 
 function buildSyncCopyPrompt(input) {

@@ -105,6 +105,7 @@ $("#fillDemo").addEventListener("click", () => {
   $("#coreSellingPoints").value = "防止项链打结；快速找到饰品；桌面马上变整齐";
   $("#useCases").value = "卧室梳妆台、早上通勤前搭配、节日礼物";
   $("#audience").value = "18-30 岁年轻女性、学生、通勤白领、喜欢饰品但桌面容易乱的人";
+  $$(".reference-copy")[0].value = "桌面乱到每次出门都找不到耳环？这个收纳盒分层很清楚，项链不会缠在一起，透明抽屉一眼就能看到。现在活动价真的很适合入。";
   $("#targetCountry").value = "泰国";
   $("#outputLanguage").value = "泰语";
   $("#planCount").value = "5";
@@ -196,6 +197,10 @@ function collectProductInput() {
     rawCoreSellingPoints: $("#coreSellingPoints").value.trim(),
     rawUseCases: $("#useCases").value.trim(),
     rawAudience: $("#audience").value.trim(),
+    referenceCopies: $$(".reference-copy")
+      .map((field) => field.value.trim())
+      .filter(Boolean)
+      .slice(0, 3),
     targetCountry: $("#targetCountry").value,
     outputLanguage: $("#outputLanguage").value,
     planCount: Number($("#planCount").value),
@@ -411,6 +416,7 @@ function generateMockAnalysis(input) {
     input.rawSellingPoints,
     input.rawUseCases,
     input.rawAudience,
+    ...(input.referenceCopies || []),
     input.competitorNotes,
   ].join(" ");
 
@@ -429,7 +435,8 @@ function generateMockAnalysis(input) {
       name: video.name || video,
       status: "待视频模型解析",
       note:
-        input.competitorNotes || "已记录该视频。当前静态原型不能读取视频画面和声音，接入后端视频理解模型后会逐个分析。",
+        input.competitorNotes ||
+        (input.referenceCopies?.length ? "已记录参考文案。当前会学习其结构和表达节奏，不直接照抄。" : "已记录该视频。当前静态原型不能读取视频画面和声音，接入后端视频理解模型后会逐个分析。"),
       index: index + 1,
     })),
     competitorAnalysis: hasCompetitor
@@ -443,9 +450,9 @@ function generateMockAnalysis(input) {
       : {
           hook: "未上传竞品参考，本次分析基于产品信息和目标市场生成。",
           sellingExpression: "围绕产品卖点、人群痛点和使用场景进行表达。",
-          originalCopy: "未上传竞品参考。",
-          originalCopyZh: "未上传竞品参考。",
-          cta: "根据价格和活动信息补充购买引导。",
+          originalCopy: input.referenceCopies?.[0] || "未上传竞品参考。",
+          originalCopyZh: input.referenceCopies?.[0] || "未上传竞品参考。",
+          cta: input.referenceCopies?.length ? "学习参考文案里的 CTA 强度和下单理由，但不照抄。" : "根据价格和活动信息补充购买引导。",
         },
   };
 }
@@ -1063,6 +1070,7 @@ function renderSummary() {
     ["国家/语言", `${input.targetCountry} / ${input.outputLanguage}`],
     ["核心卖点", input.rawCoreSellingPoints || "未填写"],
     ["卖点/促销", input.rawSellingPoints || "未填写"],
+    ["参考文案", input.referenceCopies?.length ? `${input.referenceCopies.length} 条` : "未填写"],
     ["方案数量", `${state.aiAnalysis?.planStrategies?.length || input.planCount} 条`],
     ["风格", input.selectedStyles.length ? input.selectedStyles.join("、") : "自动组合"],
     ["产品图片", `${input.productImages.length} 张`],

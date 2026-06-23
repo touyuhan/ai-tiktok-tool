@@ -204,6 +204,21 @@ h2 {
   font-size: 14px;
 }
 
+.compact-heading {
+  margin-bottom: 8px;
+}
+
+.compact-heading h2 {
+  font-size: 17px;
+}
+
+.field-help {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .field {
   display: grid;
   gap: 8px;
@@ -222,6 +237,18 @@ h2 {
 
 .field small {
   color: var(--muted);
+}
+
+.reference-copy-box {
+  margin-top: 8px;
+  padding: 16px;
+  border: 1px solid #d5e8e4;
+  border-radius: 8px;
+  background: #f2faf8;
+}
+
+.reference-copy-box .field:last-child {
+  margin-bottom: 0;
 }
 
 input[type="text"],
