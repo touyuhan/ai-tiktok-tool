@@ -1,16 +1,18 @@
 :root {
   color-scheme: light;
-  --bg: #f6f7f9;
-  --panel: #ffffff;
-  --ink: #161a22;
-  --muted: #687083;
-  --line: #dfe3ea;
-  --soft: #eef2f6;
-  --accent: #0f8f72;
-  --accent-dark: #09664f;
-  --warn: #b35f00;
+  --bg: #0b100f;
+  --panel: rgba(248, 252, 251, 0.96);
+  --panel-solid: #f8fcfb;
+  --ink: #111719;
+  --muted: #657179;
+  --line: #d5e0e2;
+  --soft: #edf6f4;
+  --accent: #00b894;
+  --accent-dark: #007f68;
+  --accent-soft: #dffbf4;
+  --warn: #a96800;
   --danger: #bd2c2c;
-  --shadow: 0 18px 45px rgba(22, 26, 34, 0.08);
+  --shadow: 0 22px 60px rgba(0, 0, 0, 0.22);
 }
 
 * {
@@ -19,7 +21,11 @@
 
 body {
   margin: 0;
-  background: var(--bg);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(135deg, #0b100f 0%, #101714 48%, #080c0b 100%);
+  background-size: 28px 28px, 28px 28px, auto;
   color: var(--ink);
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -53,9 +59,10 @@ button {
 
 .eyebrow {
   margin: 0 0 6px;
-  color: var(--accent-dark);
+  color: #52f2cb;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 800;
+  letter-spacing: 0;
 }
 
 h1,
@@ -67,6 +74,7 @@ p {
 
 h1 {
   margin-bottom: 0;
+  color: #f4fffc;
   font-size: 30px;
   line-height: 1.2;
 }
@@ -83,27 +91,35 @@ h2 {
   min-width: 320px;
 }
 
+.topbar-tools {
+  display: grid;
+  justify-items: end;
+  gap: 10px;
+}
+
 .step-pill {
-  border: 1px solid var(--line);
+  border: 1px solid rgba(210, 252, 240, 0.22);
   border-radius: 999px;
   padding: 8px 14px;
-  color: var(--muted);
-  background: var(--panel);
+  color: #b8cac5;
+  background: rgba(255, 255, 255, 0.06);
   font-size: 14px;
   font-weight: 700;
   white-space: nowrap;
+  backdrop-filter: blur(12px);
 }
 
 .step-pill.active {
   border-color: var(--accent);
-  color: var(--accent-dark);
-  background: #e8f7f2;
+  color: #031613;
+  background: #7cf7d7;
+  box-shadow: 0 0 0 1px rgba(124, 247, 215, 0.16), 0 0 22px rgba(0, 184, 148, 0.28);
 }
 
 .step-line {
   height: 1px;
   flex: 1;
-  background: var(--line);
+  background: rgba(210, 252, 240, 0.22);
 }
 
 .workspace {
@@ -126,12 +142,15 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
 }
 
 .side-panel {
   position: sticky;
   top: 20px;
   padding: 22px;
+  border-color: rgba(124, 247, 215, 0.28);
+  background: rgba(247, 252, 251, 0.92);
 }
 
 .side-panel p {
@@ -143,13 +162,13 @@ h2 {
   margin-top: 18px;
   padding: 14px;
   border-radius: 8px;
-  background: #fff7e8;
-  border: 1px solid #f3d7a5;
+  background: #ecfffa;
+  border: 1px solid #b8f2e1;
 }
 
 .note-box p {
   margin: 8px 0 0;
-  color: #6f4a14;
+  color: #23554a;
 }
 
 .form-panel,
@@ -212,7 +231,7 @@ textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   color: var(--ink);
   padding: 12px 13px;
   outline: none;
@@ -266,7 +285,7 @@ output {
 .video-row {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--soft);
+  background: #f2faf8;
   overflow: hidden;
 }
 
@@ -311,7 +330,7 @@ output {
   justify-content: flex-end;
   gap: 12px;
   padding: 20px 24px;
-  background: #fbfcfd;
+  background: #f3f8f7;
   border-top: 1px solid var(--line);
 }
 
@@ -324,7 +343,8 @@ output {
 .ghost-button,
 .small-button,
 .icon-button,
-.back-button {
+.back-button,
+.logout-button {
   border-radius: 8px;
   border: 1px solid transparent;
   min-height: 40px;
@@ -333,12 +353,13 @@ output {
 }
 
 .primary-button {
-  color: #fff;
+  color: #041411;
   background: var(--accent);
+  box-shadow: 0 10px 26px rgba(0, 184, 148, 0.24);
 }
 
 .primary-button:hover {
-  background: var(--accent-dark);
+  background: #24d7b2;
 }
 
 .ghost-button,
@@ -348,11 +369,18 @@ output {
   border-color: var(--line);
 }
 
+.logout-button {
+  min-height: 34px;
+  color: #303746;
+  background: #fff;
+  border-color: var(--line);
+}
+
 .small-button {
   min-height: 34px;
   color: var(--accent-dark);
-  background: #e8f7f2;
-  border-color: #bfe6da;
+  background: var(--accent-soft);
+  border-color: #a6ead8;
 }
 
 .compact-button {
@@ -374,7 +402,8 @@ output {
 .summary-item {
   padding: 10px;
   border-radius: 8px;
-  background: var(--soft);
+  background: #eef8f6;
+  border: 1px solid #d8ebe7;
 }
 
 .summary-item strong {
@@ -397,7 +426,7 @@ output {
 .editable-card {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   padding: 12px;
 }
 
@@ -424,7 +453,7 @@ output {
   border-radius: 999px;
   padding: 5px 9px;
   color: var(--accent-dark);
-  background: #e8f7f2;
+  background: var(--accent-soft);
   font-size: 12px;
   font-weight: 800;
 }
@@ -497,10 +526,22 @@ output {
   padding: 9px 11px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   color: #303746;
   font-size: 14px;
   font-weight: 700;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.style-grid label:has(input:checked) {
+  border-color: var(--accent);
+  background: #effffb;
+  box-shadow: inset 0 0 0 1px rgba(0, 184, 148, 0.18), 0 10px 24px rgba(0, 184, 148, 0.08);
+}
+
+.style-grid label:hover {
+  transform: translateY(-1px);
+  border-color: #8fdccb;
 }
 
 .style-grid input {
@@ -510,7 +551,7 @@ output {
 }
 
 .compact-review {
-  background: #fbfcfd;
+  background: #f2f8f7;
 }
 
 .plan-strategy-grid {
@@ -522,7 +563,7 @@ output {
 .strategy-card {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   padding: 12px;
 }
 
@@ -543,7 +584,7 @@ output {
   border-radius: 999px;
   padding: 4px 8px;
   color: var(--accent-dark);
-  background: #e8f7f2;
+  background: var(--accent-soft);
   font-size: 12px;
   font-weight: 800;
   white-space: nowrap;
@@ -572,7 +613,7 @@ output {
 .copy-card {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   padding: 14px;
 }
 
@@ -608,8 +649,8 @@ output {
 }
 
 .copy-grid textarea[data-copy-field="editedZh"] {
-  border-color: #bfd8ec;
-  background: #f7fbff;
+  border-color: #b5e6dc;
+  background: #f3fffb;
 }
 
 .model-picker {
@@ -626,9 +667,15 @@ output {
   padding: 11px 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   color: #303746;
   font-weight: 800;
+}
+
+.model-picker label:has(input:checked) {
+  border-color: var(--accent);
+  background: #effffb;
+  box-shadow: inset 0 0 0 1px rgba(0, 184, 148, 0.18);
 }
 
 .model-picker input {
@@ -647,7 +694,7 @@ output {
   border-radius: 8px;
   padding: 18px;
   color: var(--muted);
-  background: #fff;
+  background: #fbfffe;
   text-align: center;
   font-weight: 700;
 }
@@ -655,7 +702,7 @@ output {
 .script-card {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   overflow: hidden;
 }
 
@@ -669,7 +716,7 @@ output {
 
 .script-head {
   padding: 14px;
-  background: #fbfcfd;
+  background: #f2f8f7;
   border-bottom: 1px solid var(--line);
 }
 
@@ -695,7 +742,7 @@ output {
 .segment-block {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fbfcfd;
+  background: #f2f8f7;
   padding: 12px;
 }
 
@@ -706,7 +753,7 @@ output {
 .shot-block {
   border: 1px solid #e7ebf1;
   border-radius: 8px;
-  background: #fff;
+  background: #fbfffe;
   padding: 10px;
 }
 
@@ -831,6 +878,10 @@ dialog::backdrop {
   .topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .topbar-tools {
+    justify-items: stretch;
   }
 
   .step-indicator {

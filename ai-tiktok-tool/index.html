@@ -13,14 +13,17 @@
           <p class="eyebrow">内部工具原型</p>
           <h1>AI TikTok 带货短视频工作台</h1>
         </div>
-        <div class="step-indicator" aria-label="当前流程">
-          <span class="step-pill active" id="stepInput">1 输入信息</span>
-          <span class="step-line"></span>
-          <span class="step-pill" id="stepReview">2 卖点确认</span>
-          <span class="step-line"></span>
-          <span class="step-pill" id="stepCopy">3 文案微调</span>
-          <span class="step-line"></span>
-          <span class="step-pill" id="stepScript">4 脚本提示词</span>
+        <div class="topbar-tools">
+          <div class="step-indicator" aria-label="当前流程">
+            <span class="step-pill active" id="stepInput">1 输入信息</span>
+            <span class="step-line"></span>
+            <span class="step-pill" id="stepReview">2 卖点确认</span>
+            <span class="step-line"></span>
+            <span class="step-pill" id="stepCopy">3 文案微调</span>
+            <span class="step-line"></span>
+            <span class="step-pill" id="stepScript">4 脚本提示词</span>
+          </div>
+          <button class="logout-button" type="button" id="logoutButton">退出登录</button>
         </div>
       </header>
 
@@ -54,8 +57,25 @@
             <div class="upload-grid" id="imagePreview" aria-live="polite"></div>
 
             <label class="field">
-              <span>产品核心卖点</span>
-              <textarea id="sellingPoints" name="sellingPoints" rows="4" placeholder="可先输入，也可以留空让 AI 根据产品和竞品参考提炼"></textarea>
+              <span>卖点 / 促销信息</span>
+              <textarea
+                id="sellingPoints"
+                name="sellingPoints"
+                rows="4"
+                placeholder="可填写补充卖点、价格优势、套装优惠、促销活动、赠品、规格、香味/颜色/尺寸等。例如：6 种香味、买 6 包更划算、现在有活动、可放衣柜/车里/洗手间。"
+              ></textarea>
+              <small>这里的信息会帮助 AI 叠加更多购买理由，制造“太值了”的感觉。</small>
+            </label>
+
+            <label class="field">
+              <span>核心卖点</span>
+              <textarea
+                id="coreSellingPoints"
+                name="coreSellingPoints"
+                rows="3"
+                placeholder="必须在口播文案中讲到的关键卖点，建议填最不能漏掉的 1-3 个。例如：香气不冲鼻、自带挂钩、2-3 个月还有淡淡香味。"
+              ></textarea>
+              <small>核心卖点会作为强约束，后续文案必须优先覆盖。</small>
             </label>
 
             <label class="field">
@@ -185,7 +205,7 @@
 
           <section class="review-section">
             <div class="section-heading">
-              <h2>产品核心卖点</h2>
+              <h2>卖点池</h2>
               <button class="small-button" data-add="sellingPoints" type="button">＋ 新增卖点</button>
             </div>
             <div class="card-list" id="sellingPointCards"></div>

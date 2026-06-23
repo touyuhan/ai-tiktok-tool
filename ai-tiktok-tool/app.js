@@ -48,6 +48,7 @@ const styleLibrary = [
   "剧情反转",
   "礼物推荐",
   "低价冲动购买",
+  "工厂/老板视角",
   "街头采访感",
   "生活小技巧",
   "通勤/旅行场景",
@@ -62,6 +63,11 @@ planCount.addEventListener("input", () => {
 $("#targetCountry").addEventListener("change", (event) => {
   const language = countryLanguageMap[event.target.value];
   if (language) $("#outputLanguage").value = language;
+});
+
+$("#logoutButton")?.addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" }).catch(() => {});
+  window.location.href = "/login.html";
 });
 
 imageInput.addEventListener("change", () => {
@@ -95,7 +101,8 @@ $("#clearStyles").addEventListener("click", () => {
 
 $("#fillDemo").addEventListener("click", () => {
   $("#productName").value = "多层首饰收纳盒";
-  $("#sellingPoints").value = "分层收纳，防止项链打结；透明抽屉方便快速找到饰品；适合小卧室和租房空间";
+  $("#sellingPoints").value = "分层收纳，透明抽屉，适合小卧室和租房空间；现在有活动，送礼也合适";
+  $("#coreSellingPoints").value = "防止项链打结；快速找到饰品；桌面马上变整齐";
   $("#useCases").value = "卧室梳妆台、早上通勤前搭配、节日礼物";
   $("#audience").value = "18-30 岁年轻女性、学生、通勤白领、喜欢饰品但桌面容易乱的人";
   $("#targetCountry").value = "泰国";
@@ -186,6 +193,7 @@ function collectProductInput() {
     productName: $("#productName").value.trim(),
     productImages: Array.from(imageInput.files).map((file) => file.name),
     rawSellingPoints: $("#sellingPoints").value.trim(),
+    rawCoreSellingPoints: $("#coreSellingPoints").value.trim(),
     rawUseCases: $("#useCases").value.trim(),
     rawAudience: $("#audience").value.trim(),
     targetCountry: $("#targetCountry").value,
@@ -391,6 +399,7 @@ function renderVideoList() {
 function generateMockAnalysis(input) {
   const category = inferCategory(input);
   const sourceSellingPoints = splitText(input.rawSellingPoints);
+  const sourceCoreSellingPoints = splitText(input.rawCoreSellingPoints);
   const sourceUseCases = splitText(input.rawUseCases);
   const sourceAudiences = splitText(input.rawAudience);
   const hasCompetitor = input.competitorVideos.length > 0 || input.competitorNotes;
@@ -398,13 +407,14 @@ function generateMockAnalysis(input) {
   const defaults = getDefaults(category, input.targetCountry);
   const insightText = [
     input.productName,
+    input.rawCoreSellingPoints,
     input.rawSellingPoints,
     input.rawUseCases,
     input.rawAudience,
     input.competitorNotes,
   ].join(" ");
 
-  const sellingPoints = buildSellingPoints(sourceSellingPoints, defaults.sellingPoints, input);
+  const sellingPoints = buildSellingPoints([...sourceCoreSellingPoints, ...sourceSellingPoints], defaults.sellingPoints, input, sourceCoreSellingPoints.length);
   const useCases = buildUseCases(sourceUseCases, defaults.useCases, input);
   const audiences = buildAudiences(sourceAudiences, defaults.audiences, category, insightText);
   const painPoints = buildPainPoints(defaults.painPoints, category, insightText);
@@ -442,17 +452,33 @@ function generateMockAnalysis(input) {
 
 function generateMockCopyDrafts(productInput, aiAnalysis) {
   return aiAnalysis.planStrategies.map((strategy) => {
-    const sellingPoint = aiAnalysis.sellingPoints[(strategy.planNo - 1) % aiAnalysis.sellingPoints.length];
-    const nowReason = productInput.targetCountry === "马来西亚" ? "Harga tengah berbaloi, jangan tunggu lama." : "Add to cart sekarang.";
+    const requiredPoints = splitText(productInput.rawCoreSellingPoints);
+    const pointTitles = aiAnalysis.sellingPoints
+      .map((point) => point.title)
+      .filter(Boolean);
+    const valueStack = [...requiredPoints, ...pointTitles]
+      .filter((point, index, arr) => point && arr.indexOf(point) === index)
+      .slice(0, 5);
+    const valueStackMs = valueStack.length
+      ? valueStack.join(", ")
+      : aiAnalysis.sellingPoints[(strategy.planNo - 1) % aiAnalysis.sellingPoints.length]?.title || "senang guna";
+    const valueStackZh = valueStack.length ? valueStack.join("、") : "实用、好看、多场景可用、价格划算";
+    const promoText = productInput.rawSellingPoints || "";
+    const hasPromo = /促销|优惠|折扣|活动|买|送|包邮|低价|便宜|price|sale|promo|discount/i.test(promoText);
+    const nowReason = hasPromo
+      ? "Kalau nampak promo sekarang, memang lagi berbaloi."
+      : productInput.targetCountry === "马来西亚"
+        ? "Seller tengah buat promo, jangan tunggu lama."
+        : "Seller is running a deal now, add to cart first.";
     return {
       planNo: strategy.planNo,
       style: strategy.style,
       audience: strategy.audience,
       duration: "20-30s",
       hook: `Kalau ${strategy.audience} selalu ada masalah ${strategy.painPoint}, tengok ni.`,
-      voiceover: `Kalau ${strategy.audience} selalu rasa ${strategy.painPoint}, produk kecil ni memang kena cuba. ${sellingPoint.title} memang senang faham dan senang guna. Dia nampak comel, sesuai untuk ${strategy.scene}, dan boleh beli beberapa pek untuk letak dekat tempat berbeza. ${nowReason}`,
-      voiceoverZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。核心卖点是“${sellingPoint.title}”，简单好理解，也很容易使用。它造型可爱，适合${strategy.scene}，还可以买几包放在不同位置。现在价格合适，别等太久。`,
-      editedZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。核心卖点是“${sellingPoint.title}”，简单好理解，也很容易使用。它造型可爱，适合${strategy.scene}，还可以买几包放在不同位置。现在价格合适，别等太久。`,
+      voiceover: `Kalau ${strategy.audience} selalu rasa ${strategy.painPoint}, produk kecil ni memang kena cuba. Nilai dia banyak: ${valueStackMs}. Sesuai letak dekat ${strategy.scene}, boleh beli beberapa pek untuk tempat berbeza, rasa macam sangat berbaloi untuk harga dia. ${nowReason}`,
+      voiceoverZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。它的值感要讲满：${valueStackZh}。适合${strategy.scene}，还可以买几包放在不同位置，给人感觉这个价格能解决好多小问题。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
+      editedZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。它的值感要讲满：${valueStackZh}。适合${strategy.scene}，还可以买几包放在不同位置，给人感觉这个价格能解决好多小问题。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
       cta: nowReason,
       selected: true,
     };
@@ -472,7 +498,7 @@ function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
         return {
           shotNo,
           duration: Math.max(2, Math.round(segmentDuration / (videoModel === "veo" ? 3 : 4))),
-          referenceImagePrompt: `【参考图编号】\n${refNo}\n\n【画面主体】\n${productInput.productName} 在真实生活场景中出现，突出产品真实使用感；产品外观、颜色、形状、包装、图案和细节如产品参考图所示。\n\n【人物与动作】\n真实 TikTok 用户，穿着日常，肤色、发型和五官自然，表情放松，正在展示或使用产品，产品如图所示；整体生活状态符合${productInput.targetCountry}日常内容氛围，但不使用刻板印象或国籍标签。\n\n【场景与本土化】\n普通家庭空间，衣柜、车内、洗手间或客厅等真实环境，通过空间细节体现本土生活方式；产品摆放和使用方式如产品参考图所示。\n\n【画面风格】\n真实手机拍摄、TikTok UGC、自然光、不像广告大片。\n\n【构图】\n竖屏 9:16，中近景或手部特写。\n\n【避免】\n不要夸张香味烟雾，不要产品变形，不要改变产品颜色/形状/包装，不要假 logo，不要欧美豪宅背景。`,
+          referenceImagePrompt: `【参考图编号】\n${refNo}\n\n【画面主体】\n${productInput.productName} 在真实生活场景中出现，画面信息密度高，同时能看到产品、包装/配件、使用环境和人物动作；产品外观、颜色、形状、包装、图案和细节如产品参考图所示。\n\n【人物与动作】\n真实 TikTok 用户或老板/工厂人员，穿着日常，肤色、发型和五官自然，表情放松，正在展示或使用产品，产品如图所示；如果是工厂/老板视角，老板拿着产品走向镜头，背景工人正在打包或搬纸箱，现场有真实忙碌感。\n\n【场景与本土化】\n普通家庭空间、仓库或工厂打包区，通过衣柜、车内、洗手间、客厅、纸箱堆、包装台、工人动作等细节体现真实场景；产品摆放和使用方式如产品参考图所示。\n\n【画面风格】\n真实手机拍摄、TikTok UGC、自然光、不像广告大片；允许轻微手持晃动、自然杂乱和现场不完美。\n\n【构图】\n竖屏 9:16，中近景或手部特写；可以做拼图/多宫格参考，让包装、使用状态和效果对比同屏出现。\n\n【避免】\n不要夸张香味烟雾，不要产品变形，不要改变产品颜色/形状/包装，不要假 logo，不要欧美豪宅背景。`,
           videoPrompt: `【模型】\n${modelName}\n\n【段落与镜头】\n第 ${segmentIndex + 1} 段，第 ${shotNo} 镜头，时长 ${Math.max(2, Math.round(segmentDuration / (videoModel === "veo" ? 3 : 4)))} 秒。\n\n【参考图】\n分镜图 ${shotNo}，画面和产品如分镜图 ${shotNo} 所示。\n\n【动态内容】\n人物自然展示 ${productInput.productName}，把产品放到真实生活场景中，强化“${draft.audience}”的购买理由。\n\n【镜头运动】\n手持轻微晃动，慢推近，真实第一人称视角。\n\n【口播/字幕】\n${draft.voiceover}\n\n【风格】\n真实 TikTok UGC，本土生活感，手机拍摄。\n\n【约束】\n保持产品形状一致，画质风格接地气，不改变产品，不生成夸张，不加入无关人物，不出现乱码文字。`,
         };
       });
@@ -502,12 +528,12 @@ function parseDurationSeconds(durationText) {
   return Number(matches[matches.length - 1]);
 }
 
-function buildSellingPoints(sourceSellingPoints, fallbackItems, input) {
+function buildSellingPoints(sourceSellingPoints, fallbackItems, input, coreCount = 0) {
   const items = sourceSellingPoints.map((point, index) => ({
     title: point.slice(0, 18),
     description: point,
-    angle: index === 0 ? "优先放到开头 3 秒，直接告诉用户为什么要停留" : "用真实细节或场景动作证明卖点",
-    isPrimary: index === 0,
+    angle: index < coreCount ? "核心卖点，口播文案必须优先覆盖" : "补充卖点或促销信息，用来叠加值感",
+    isPrimary: index < Math.max(1, coreCount),
   }));
 
   if (items.length > 0) return items;
@@ -671,6 +697,7 @@ function getStyleAngle(style, painPoint, scene) {
     剧情反转: `前半段制造小麻烦，后半段用产品完成反转。`,
     礼物推荐: `把产品包装成送礼选择，强调实用、好看、不容易踩雷。`,
     低价冲动购买: `突出低决策成本和即时可得的改善，CTA 更直接。`,
+    "工厂/老板视角": `用工厂/仓库/老板或厂长视角制造高信息密度：包装箱、产品细节、工人动作、老板口播、真实小插曲同时出现。`,
     街头采访感: `用路人提问或快速反应测试带出卖点。`,
     生活小技巧: `把产品作为一个实用小技巧，降低广告感。`,
     "通勤/旅行场景": `放到出门、通勤或旅行准备流程里展示。`,
@@ -784,7 +811,7 @@ function expandAudiences(baseAudiences, category, defaultAudiences) {
 }
 
 function inferCategory(input) {
-  const text = `${input.productName} ${input.rawSellingPoints} ${input.rawUseCases}`.toLowerCase();
+  const text = `${input.productName} ${input.rawCoreSellingPoints} ${input.rawSellingPoints} ${input.rawUseCases}`.toLowerCase();
   const match = Object.entries(categorySignals).find(([, words]) =>
     words.some((word) => text.includes(word.toLowerCase()))
   );
@@ -1034,6 +1061,8 @@ function renderSummary() {
   $("#inputSummary").innerHTML = [
     ["产品", input.productName],
     ["国家/语言", `${input.targetCountry} / ${input.outputLanguage}`],
+    ["核心卖点", input.rawCoreSellingPoints || "未填写"],
+    ["卖点/促销", input.rawSellingPoints || "未填写"],
     ["方案数量", `${state.aiAnalysis?.planStrategies?.length || input.planCount} 条`],
     ["风格", input.selectedStyles.length ? input.selectedStyles.join("、") : "自动组合"],
     ["产品图片", `${input.productImages.length} 张`],
