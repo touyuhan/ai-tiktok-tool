@@ -199,6 +199,12 @@ h2 {
   margin-bottom: 18px;
 }
 
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .section-heading span {
   color: var(--muted);
   font-size: 14px;
@@ -680,6 +686,31 @@ output {
   background: #f3fffb;
 }
 
+.script-copy-block {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.script-copy-block textarea {
+  min-height: 120px;
+  line-height: 1.55;
+}
+
+.segment-copy {
+  margin-bottom: 10px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #f6fbfa;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.segment-copy strong {
+  color: var(--ink);
+}
+
 .model-picker {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -760,6 +791,49 @@ output {
   font-weight: 700;
 }
 
+.script-meta {
+  display: grid;
+  gap: 10px;
+  padding: 0 14px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfffe;
+}
+
+.script-meta label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.script-meta strong {
+  display: block;
+  margin-bottom: 0;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.script-meta span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.script-meta em {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border: 1px solid #cfe4df;
+  border-radius: 999px;
+  background: #effaf7;
+  color: var(--accent-dark);
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .script-body {
   display: grid;
   gap: 12px;
@@ -815,6 +889,17 @@ output {
   color: var(--muted);
   font-size: 13px;
   font-weight: 700;
+}
+
+.compact-check {
+  white-space: nowrap;
+}
+
+.script-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .competitor-analysis {
@@ -897,6 +982,19 @@ dialog::backdrop {
   line-height: 1.7;
 }
 
+.dialog-form {
+  display: grid;
+  gap: 14px;
+}
+
+.dialog-form .field {
+  margin: 0;
+}
+
+.dialog-actions {
+  margin-top: 4px;
+}
+
 @media (max-width: 960px) {
   .app-shell {
     padding: 16px;
@@ -928,6 +1026,7 @@ dialog::backdrop {
   .competitor-analysis,
   .strategy-fields,
   .copy-grid,
+  .script-copy-block,
   .model-picker,
   .prompt-grid {
     grid-template-columns: 1fr;

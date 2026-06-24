@@ -30,7 +30,7 @@
       <section class="workspace" id="inputView">
         <aside class="side-panel">
           <h2>本步骤目标</h2>
-          <p>收集产品、市场和竞品参考。提交后先让 AI 提炼卖点、人群、痛点和场景，团队确认后再进入视频方案生成。</p>
+          <p>收集产品、市场和竞品参考。提交后先让 AI 提炼卖点、人群和开头切入，团队确认后再进入视频方案生成。</p>
           <div class="note-box">
             <strong>建议</strong>
             <p>产品图片至少上传 2 张：一张清晰主体图，一张使用场景图。竞品视频可选，没有也可以继续。</p>
@@ -68,14 +68,14 @@
             </label>
 
             <label class="field">
-              <span>核心卖点</span>
+              <span>必须要在视频中呈现的点</span>
               <textarea
                 id="coreSellingPoints"
                 name="coreSellingPoints"
                 rows="3"
-                placeholder="必须在口播文案中讲到的关键卖点，建议填最不能漏掉的 1-3 个。例如：香气不冲鼻、自带挂钩、2-3 个月还有淡淡香味。"
+                placeholder="必须在视频内容里明确呈现出来的关键点，建议填最不能漏掉的 1-3 个。例如：项链不会打结、抽屉透明好找、桌面收纳前后对比明显。"
               ></textarea>
-              <small>核心卖点会作为强约束，后续文案必须优先覆盖。</small>
+              <small>这些点会作为强约束，后续卖点分析、文案生成和脚本提示词都会优先覆盖，并要求在画面中真实呈现。</small>
             </label>
 
             <label class="field">
@@ -210,8 +210,8 @@
       <section class="workspace hidden" id="reviewView">
         <aside class="side-panel">
           <button class="back-button" id="backToInput" type="button">← 返回修改输入</button>
-          <h2>卖点与人群确认</h2>
-          <p>确认全局卖点，并检查每条方案对应的风格、人群和痛点。人群和痛点允许重复，也可以逐条改。</p>
+          <h2>卖点与开头确认</h2>
+          <p>确认全局卖点，并检查每条方案对应的风格、人群和开头切入。开头切入重点服务停留和人群命中，可以逐条改。</p>
           <div class="summary-list" id="inputSummary"></div>
         </aside>
 
@@ -219,7 +219,7 @@
           <section class="review-section compact-review">
             <div class="section-heading">
               <h2>方案策略卡</h2>
-              <span>按生成数量自动匹配风格、人群、痛点</span>
+              <span>按生成数量自动匹配风格、人群和开头切入</span>
             </div>
             <div class="plan-strategy-grid" id="planStrategyCards"></div>
           </section>
@@ -242,18 +242,10 @@
 
           <section class="review-section">
             <div class="section-heading">
-              <h2>痛点素材池</h2>
-              <button class="small-button" data-add="painPoints" type="button">＋ 新增痛点</button>
+              <h2>开头切入池</h2>
+              <button class="small-button" data-add="openingHooks" type="button">＋ 新增切入</button>
             </div>
-            <div class="card-list" id="painPointCards"></div>
-          </section>
-
-          <section class="review-section">
-            <div class="section-heading">
-              <h2>使用场景</h2>
-              <button class="small-button" data-add="useCases" type="button">＋ 新增场景</button>
-            </div>
-            <div class="card-list" id="useCaseCards"></div>
+            <div class="card-list" id="openingHookCards"></div>
           </section>
 
           <section class="review-section">
@@ -295,6 +287,7 @@
 
           <div class="actions">
             <button type="button" class="ghost-button" id="regenerateCopy">重新生成文案</button>
+            <button type="button" class="ghost-button" id="syncSelectedCopy">一键同步保留文案到目标语言</button>
             <button type="button" class="primary-button" id="confirmCopy">确认所选文案，生成脚本</button>
           </div>
         </div>
@@ -327,8 +320,13 @@
           <section class="review-section">
             <div class="section-heading">
               <h2>生成结果</h2>
-              <button class="small-button" type="button" id="generateScripts">生成脚本提示词</button>
+              <div class="section-actions">
+                <button class="small-button" type="button" id="openFeishuConfig">飞书配置</button>
+                <button class="small-button" type="button" id="exportToFeishu">导出到飞书</button>
+                <button class="small-button" type="button" id="generateScripts">生成脚本提示词</button>
+              </div>
             </div>
+            <div class="field-help">勾选要保留并导出的脚本；导出时只需要填写飞书多维表链接，产品信息表如已存在会先询问是否更新。</div>
             <div class="script-list" id="scriptCards"></div>
           </section>
         </div>
@@ -340,6 +338,31 @@
           <p>已生成分镜图 prompt 和视频 prompt，可以复制到 Sora / Veo 工作流中使用。</p>
           <button class="primary-button" id="closeDialog" type="button">知道了</button>
         </div>
+      </dialog>
+
+      <dialog id="feishuConfigDialog">
+        <form class="dialog-card dialog-form" id="feishuConfigForm" method="dialog">
+          <h2>飞书导出配置</h2>
+          <p>首次导出前请粘贴要写入的飞书多维表链接。配置信息会保存在当前浏览器。</p>
+
+          <label class="field">
+            <span>飞书多维表链接 <em>*</em></span>
+            <input
+              id="feishuBitableUrl"
+              name="feishuBitableUrl"
+              type="url"
+              placeholder="https://xxx.feishu.cn/base/..."
+              required
+            />
+            <small>请粘贴目标多维表页面链接。系统会自动识别并在其中查找或创建“产品信息表”和“脚本文案表”。</small>
+          </label>
+
+          <div class="actions dialog-actions">
+            <button class="ghost-button" id="cancelFeishuConfig" type="button">取消</button>
+            <button class="small-button" id="testFeishuConfig" type="button">测试连接</button>
+            <button class="primary-button" id="saveFeishuConfig" type="submit">保存并导出</button>
+          </div>
+        </form>
       </dialog>
     </main>
 

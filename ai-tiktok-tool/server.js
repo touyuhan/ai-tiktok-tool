@@ -4,6 +4,23 @@ const tls = require("tls");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const {
+  getFeishuConfigWithOverrides,
+  getTenantAccessToken,
+  ensureTableByName,
+  parseFeishuBitableUrl,
+  listAllTables,
+  listFields,
+  findRecordByField,
+  createRecord,
+  updateRecord,
+  buildProductInfoFields,
+  buildScriptExportFields,
+  PRODUCT_FIELDS,
+  SCRIPT_FIELDS,
+  PRODUCT_TABLE_NAME,
+  SCRIPT_TABLE_NAME,
+} = require("./feishu");
 
 const PORT = Number(process.env.PORT || 4173);
 const AI_PROVIDER = (process.env.AI_PROVIDER || "openai").toLowerCase();
@@ -68,6 +85,14 @@ const server = http.createServer(async (req, res) => {
       await handleScript(req, res);
       return;
     }
+    if (req.method === "POST" && req.url === "/api/feishu/export") {
+      await handleFeishuExport(req, res);
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/feishu/diagnose") {
+      await handleFeishuDiagnose(req, res);
+      return;
+    }
     if (req.method === "GET") {
       serveStatic(req, res);
       return;
@@ -127,11 +152,11 @@ function handleMe(req, res) {
 
 async function handleAnalyze(req, res) {
   const input = await readJsonBody(req);
+  if (process.env.MOCK_AI === "1") {
+    sendJson(res, 200, { analysis: createMockAnalysis(input) });
+    return;
+  }
   if (!hasProviderKey()) {
-    if (process.env.MOCK_AI === "1") {
-      sendJson(res, 200, { analysis: createMockAnalysis(input) });
-      return;
-    }
     sendJson(res, 500, { error: missingKeyMessage() });
     return;
   }
@@ -148,11 +173,11 @@ async function handleAnalyze(req, res) {
 
 async function handleCopy(req, res) {
   const input = await readJsonBody(req);
+  if (process.env.MOCK_AI === "1") {
+    sendJson(res, 200, { copyDrafts: createMockCopyDrafts(input) });
+    return;
+  }
   if (!hasProviderKey()) {
-    if (process.env.MOCK_AI === "1") {
-      sendJson(res, 200, { copyDrafts: createMockCopyDrafts(input) });
-      return;
-    }
     sendJson(res, 500, { error: missingKeyMessage() });
     return;
   }
@@ -165,18 +190,19 @@ async function handleCopy(req, res) {
     schemaName: "tiktok_copy_drafts",
     schema: copySchema(planCount),
   });
-  sendJson(res, 200, { copyDrafts: copyDrafts.copyDrafts });
+  const repairedDrafts = await ensureChineseCopyDrafts(copyDrafts.copyDrafts, input);
+  sendJson(res, 200, { copyDrafts: repairedDrafts });
 }
 
 async function handleSyncCopy(req, res) {
   const input = await readJsonBody(req);
+  if (process.env.MOCK_AI === "1") {
+    sendJson(res, 200, {
+      voiceover: createMockSyncedVoiceover(input),
+    });
+    return;
+  }
   if (!hasProviderKey()) {
-    if (process.env.MOCK_AI === "1") {
-      sendJson(res, 200, {
-        voiceover: createMockSyncedVoiceover(input),
-      });
-      return;
-    }
     sendJson(res, 500, { error: missingKeyMessage() });
     return;
   }
@@ -193,11 +219,11 @@ async function handleSyncCopy(req, res) {
 
 async function handleScript(req, res) {
   const input = await readJsonBody(req);
+  if (process.env.MOCK_AI === "1") {
+    sendJson(res, 200, { scripts: normalizeVideoScripts(createMockVideoScripts(input)) });
+    return;
+  }
   if (!hasProviderKey()) {
-    if (process.env.MOCK_AI === "1") {
-      sendJson(res, 200, { scripts: createMockVideoScripts(input) });
-      return;
-    }
     sendJson(res, 500, { error: missingKeyMessage() });
     return;
   }
@@ -210,7 +236,176 @@ async function handleScript(req, res) {
     schemaName: "video_generation_scripts",
     schema: scriptSchema(scriptCount),
   });
-  sendJson(res, 200, { scripts: result.scripts });
+  sendJson(res, 200, { scripts: normalizeVideoScripts(result.scripts) });
+}
+
+async function handleFeishuExport(req, res) {
+  const input = await readJsonBody(req);
+  const config = getFeishuConfigWithOverrides(input.feishu || {});
+  const tenantAccessToken = await getTenantAccessToken(config);
+  const productInput = input.productInput || {};
+  const aiAnalysis = input.aiAnalysis || {};
+  const videoScripts = Array.isArray(input.videoScripts) ? input.videoScripts : [];
+  const selectedScripts = videoScripts.filter((script, index) => input.selectedIndexes?.includes(index) || script.selected);
+  if (!selectedScripts.length) {
+    sendJson(res, 400, { error: "请至少选择 1 条脚本导出。" });
+    return;
+  }
+
+  const productTable = await ensureTableByName({
+    appToken: config.appToken,
+    tenantAccessToken,
+    tableId: config.productTableId || "",
+    name: PRODUCT_TABLE_NAME,
+    fields: PRODUCT_FIELDS,
+  });
+  const scriptTable = await ensureTableByName({
+    appToken: config.appToken,
+    tenantAccessToken,
+    tableId: config.scriptTableId || "",
+    preferredTableId: config.linkedTableId || "",
+    name: SCRIPT_TABLE_NAME,
+    fields: SCRIPT_FIELDS,
+  });
+
+  const productName = productInput.productName || "";
+  let productRecord = null;
+  if (productName) {
+    productRecord = await findRecordByField({
+      appToken: config.appToken,
+      tableId: productTable.tableId,
+      tenantAccessToken,
+      fieldName: "产品名称",
+      value: productName,
+    });
+  }
+
+  if (productRecord && !input.confirmProductUpdate) {
+    sendJson(res, 200, {
+      needConfirmUpdate: true,
+      message: `飞书里已经有产品「${productName}」记录，是否更新这条产品信息表？`,
+      productTable,
+      scriptTable,
+      matchedRecordId: productRecord.record_id || "",
+    });
+    return;
+  }
+
+  const productFields = buildProductInfoFields({ productInput, aiAnalysis });
+  if (productRecord) {
+    await updateRecord({
+      appToken: config.appToken,
+      tableId: productTable.tableId,
+      tenantAccessToken,
+      recordId: productRecord.record_id,
+      fields: productFields,
+    });
+  } else {
+    await createRecord({
+      appToken: config.appToken,
+      tableId: productTable.tableId,
+      tenantAccessToken,
+      fields: productFields,
+    });
+  }
+
+  const createdRecords = [];
+  for (const script of selectedScripts) {
+    const fields = buildScriptExportFields({
+      script,
+      productInput,
+      selectedAt: new Date(),
+    });
+    const record = await createRecord({
+      appToken: config.appToken,
+      tableId: scriptTable.tableId,
+      tenantAccessToken,
+      fields,
+    });
+    createdRecords.push(record?.record_id || "");
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    updatedProduct: Boolean(productRecord),
+    productTable,
+    scriptTable,
+    createdCount: createdRecords.length,
+    createdRecordIds: createdRecords,
+  });
+}
+
+async function handleFeishuDiagnose(req, res) {
+  const input = await readJsonBody(req);
+  const config = getFeishuConfigWithOverrides(input.feishu || {});
+  const parsed = parseFeishuBitableUrl(config.bitableUrl);
+
+  const result = {
+    ok: false,
+    parsed: {
+      appToken: parsed.appToken,
+      tableId: parsed.table || "",
+      viewId: parsed.view || "",
+    },
+    steps: [],
+  };
+
+  result.steps.push({ step: "parse_link", ok: true, detail: "已成功解析飞书多维表链接。" });
+
+  const tenantAccessToken = await getTenantAccessToken(config);
+  result.steps.push({ step: "get_token", ok: true, detail: "已成功获取 tenant_access_token。" });
+
+  if (parsed.table) {
+    try {
+      const fields = await listFields({
+        appToken: config.appToken,
+        tableId: parsed.table,
+        tenantAccessToken,
+      });
+      result.steps.push({
+        step: "get_current_table",
+        ok: true,
+        detail: `可直接读取链接中的 table，当前字段 ${fields.length} 个。`,
+      });
+    } catch (error) {
+      result.steps.push({
+        step: "get_current_table",
+        ok: false,
+        detail: error.message,
+      });
+    }
+  } else {
+    result.steps.push({
+      step: "get_current_table",
+      ok: false,
+      detail: "链接中没有 table 参数，暂时无法直接验证当前 sheet。",
+    });
+  }
+
+  try {
+    const tables = await listAllTables({
+      appToken: config.appToken,
+      tenantAccessToken,
+    });
+    result.steps.push({
+      step: "list_tables",
+      ok: true,
+      detail: `可列出 ${tables.length} 个 sheet。`,
+      tables: tables.slice(0, 10).map((table) => ({
+        tableId: table.table_id || table.id || "",
+        name: table.name || table.table_name || "",
+      })),
+    });
+  } catch (error) {
+    result.steps.push({
+      step: "list_tables",
+      ok: false,
+      detail: error.message,
+    });
+  }
+
+  result.ok = result.steps.every((item) => item.ok);
+  sendJson(res, 200, result);
 }
 
 function hasProviderKey() {
@@ -238,16 +433,18 @@ function createMockAnalysis(input) {
       isPrimary: index === 0,
     })
   );
-  const painPoints = [
-    "衣柜有闷味，衣服不够清新",
-    "鞋柜、洗手间、车里有小异味",
-    "香薰太浓太刺鼻",
-    "想让衣服香香但不想每天喷香水",
-    "想买便宜又实用的家居小物",
-  ].map((pain, index) => ({
-    pain,
-    emotion: "希望简单、便宜、马上改善。",
-    videoExpression: "用真实场景 before/after 展示。",
+  const openingHooks = [
+    ["引起共鸣", "一拉开衣柜就有闷味，目标人群一秒代入。", "用真实小烦恼直接命中高频用户。", "喜欢衣服香香的人", "衣柜和卧室", "用真实场景 before/after 展示。"],
+    ["引起共鸣", "鞋柜、洗手间、车里都有异味，一开场就把生活困扰摆出来。", "多空间困扰容易让用户继续看下去。", "家里有异味困扰的人", "鞋柜、洗手间、车内", "从有味道的空间切到放入产品后的变化。"],
+    ["引起好奇", "这么小一个东西为什么能让房间味道变舒服？", "小产品大变化自带反差感。", "想买便宜又实用家居小物的人", "卧室或客厅", "先给变化结果，再回到产品。"],
+    ["引起向往", "房间和衣服都闻起来干净又高级，让人想直接复制这种生活感。", "理想生活感容易提升停留。", "年轻女生", "卧室、梳妆区", "展示精致空间和细节。"],
+  ].map(([hookType, summary, stayReason, targetAudience, sceneHint, videoExpression], index) => ({
+    hookType,
+    summary,
+    stayReason,
+    targetAudience,
+    sceneHint,
+    videoExpression,
     priority: index + 1,
   }));
   const useCases = splitLocal(input.rawUseCases || "衣柜、鞋柜、洗手间、客厅、车内").map((scene) => ({
@@ -271,15 +468,17 @@ function createMockAnalysis(input) {
     planNo: index + 1,
     style: styles[index % styles.length],
     audience: audiences[index % audiences.length]?.name || "目标用户",
-    painPoint: painPoints[index % painPoints.length].pain,
-    scene: useCases[index % useCases.length]?.scene || "日常场景",
-    angle: "开头抓痛点，中间叠加卖点，结尾促销下单。",
+    hookType: openingHooks[index % openingHooks.length].hookType,
+    openingSummary: openingHooks[index % openingHooks.length].summary,
+    openingDetail: openingHooks[index % openingHooks.length].videoExpression,
+    sceneHint: useCases[index % useCases.length]?.scene || "日常场景",
+    angle: "开头优先增加停留并打中目标人群，中间叠加卖点，结尾促销下单。",
   }));
 
   return {
     sellingPoints,
     audiences,
-    painPoints,
+    openingHooks,
     useCases,
     planStrategies,
     competitorVideoAnalyses: (input.competitorVideos || []).map((video, index) => ({
@@ -316,13 +515,127 @@ function createMockCopyDrafts(input) {
     style: strategy.style,
     audience: strategy.audience,
     duration: "20-30s",
-    hook: `Kalau ${strategy.audience} selalu pening dengan ${strategy.painPoint}, dengar ni.`,
-    voiceover: `Kalau ${strategy.audience} selalu pening dengan ${strategy.painPoint}, benda kecil ni memang kena cuba. Nilai dia banyak: ${valueStack}. Letak dekat ${strategy.scene}, boleh beli beberapa pek untuk tempat berbeza, rasa macam satu harga boleh settle banyak masalah kecil. ${hasPromo ? "Promo macam ni memang lagi berbaloi, add to cart sekarang." : "Seller tengah buat promo, jangan tunggu lama, add to cart sekarang."}`,
-    voiceoverZh: `如果${strategy.audience}经常被“${strategy.painPoint}”困扰，这个小东西真的可以试。它要把值感讲满：${valueStack}。直接放在${strategy.scene}，还可以买几包放在不同地方，给人感觉一个价格解决很多小问题。${hasPromo ? "如果用户给了促销信息，就把促销点讲进去并引导下单。" : "如果没有具体促销，就用“现在卖家在做活动”这类宽泛说法引导下单。"}`,
-    editedZh: `如果${strategy.audience}经常被“${strategy.painPoint}”困扰，这个小东西真的可以试。它要把值感讲满：${valueStack}。直接放在${strategy.scene}，还可以买几包放在不同地方，给人感觉一个价格解决很多小问题。${hasPromo ? "如果用户给了促销信息，就把促销点讲进去并引导下单。" : "如果没有具体促销，就用“现在卖家在做活动”这类宽泛说法引导下单。"}`,
+    hook: `Kalau ${strategy.audience} terus rasa “ini memang pasal aku”, dengar ni.`,
+    voiceover: `Kalau ${strategy.audience} terus rasa “ini memang pasal aku”, benda kecil ni memang kena cuba. Nilai dia banyak: ${valueStack}. Masukkan terus dalam ${strategy.sceneHint}, biar orang nampak perubahan tu cepat. ${hasPromo ? "Promo macam ni memang lagi berbaloi, add to cart sekarang." : "Seller tengah buat promo, jangan tunggu lama, add to cart sekarang."}`,
+    voiceoverZh: `先用“${strategy.openingSummary}”把${strategy.audience}留住，这个小东西真的可以试。它要把值感讲满：${valueStack}。直接放进${strategy.sceneHint}这类真实生活流程里，让人马上看到变化。${hasPromo ? "如果用户给了促销信息，就把促销点讲进去并引导下单。" : "如果没有具体促销，就用“现在卖家在做活动”这类宽泛说法引导下单。"}`,
+    editedZh: `先用“${strategy.openingSummary}”把${strategy.audience}留住，这个小东西真的可以试。它要把值感讲满：${valueStack}。直接放进${strategy.sceneHint}这类真实生活流程里，让人马上看到变化。${hasPromo ? "如果用户给了促销信息，就把促销点讲进去并引导下单。" : "如果没有具体促销，就用“现在卖家在做活动”这类宽泛说法引导下单。"}`,
     cta: "Add to cart sekarang.",
     selected: true,
   }));
+}
+
+async function ensureChineseCopyDrafts(copyDrafts, input) {
+  const drafts = Array.isArray(copyDrafts) ? copyDrafts : [];
+  const needsRepair = drafts
+    .map((draft, index) => ({ draft, index }))
+    .filter(({ draft }) => !isMostlyChinese(draft?.voiceoverZh) || !isMostlyChinese(draft?.editedZh));
+
+  if (!needsRepair.length) {
+    return drafts.map((draft) => ({
+      ...draft,
+      editedZh: draft.editedZh || draft.voiceoverZh || "",
+    }));
+  }
+
+  try {
+    const repaired = await callModel({
+      system:
+        "你是中文电商口播文案编辑。必须只输出合法 JSON，不要 Markdown。你的任务是把非中文或错误语言的中文稿字段修复为自然简体中文。",
+      user: buildChineseCopyRepairPrompt(needsRepair, input),
+      schemaName: "chinese_copy_repair",
+      schema: chineseCopyRepairSchema(needsRepair.length),
+    });
+    const repairMap = new Map((repaired.repairedDrafts || []).map((item) => [Number(item.index), item]));
+    return drafts.map((draft, index) => {
+      const fallbackZh = createFallbackChineseDraft(draft, input, index);
+      const repairedItem = repairMap.get(index);
+      const repairedZh = repairedItem?.editedZh || repairedItem?.voiceoverZh || "";
+      const voiceoverZh = isMostlyChinese(repairedItem?.voiceoverZh)
+        ? repairedItem.voiceoverZh
+        : isMostlyChinese(repairedZh)
+          ? repairedZh
+          : isMostlyChinese(draft.voiceoverZh)
+            ? draft.voiceoverZh
+            : fallbackZh;
+      const editedZh = isMostlyChinese(repairedItem?.editedZh)
+        ? repairedItem.editedZh
+        : isMostlyChinese(draft.editedZh)
+          ? draft.editedZh
+          : voiceoverZh;
+      return {
+        ...draft,
+        voiceoverZh,
+        editedZh,
+      };
+    });
+  } catch (error) {
+    console.warn("中文微调稿自动修复失败，使用本地兜底文案：", error.message);
+    return drafts.map((draft, index) => {
+      const fallbackZh = createFallbackChineseDraft(draft, input, index);
+      return {
+        ...draft,
+        voiceoverZh: isMostlyChinese(draft.voiceoverZh) ? draft.voiceoverZh : fallbackZh,
+        editedZh: isMostlyChinese(draft.editedZh) ? draft.editedZh : fallbackZh,
+      };
+    });
+  }
+}
+
+function buildChineseCopyRepairPrompt(items, input) {
+  return JSON.stringify(
+    {
+      task: "修复文案里的中文字段。voiceover 保持原目标语言不改；voiceoverZh 和 editedZh 必须输出自然简体中文。",
+      rules: [
+        "不要逐字硬翻，要改写成中国团队能直接审核和微调的中文口播稿。",
+        "保留原口播里的 hook、卖点叠加、促销/下单理由和语气强度。",
+        "如果原中文字段是泰语、马来语、英语或其他语言，必须翻译/改写成中文。",
+        "editedZh 必须等于或略优于 voiceoverZh，不能再出现目标语言。",
+        "不要添加未经产品信息支持的新功效，不要夸大除菌、治病、永久除味。",
+      ],
+      productInput: input.productInput,
+      aiAnalysis: input.aiAnalysis,
+      drafts: items.map(({ draft, index }) => ({
+        index,
+        planNo: draft.planNo,
+        style: draft.style,
+        audience: draft.audience,
+        hook: draft.hook,
+        voiceover: draft.voiceover,
+        currentVoiceoverZh: draft.voiceoverZh,
+        currentEditedZh: draft.editedZh,
+      })),
+    },
+    null,
+    2
+  );
+}
+
+function createFallbackChineseDraft(draft, input, index) {
+  const productInput = input.productInput || {};
+  const plan = input.aiAnalysis?.planStrategies?.[index] || {};
+  const sellingPoints = [
+    ...splitLocal(productInput.rawCoreSellingPoints),
+    ...splitLocal(productInput.rawSellingPoints),
+    ...(input.aiAnalysis?.sellingPoints || []).flatMap((point) => [point.title, point.description]),
+  ]
+    .filter(Boolean)
+    .filter((point, pointIndex, arr) => arr.indexOf(point) === pointIndex)
+    .slice(0, 6);
+  const valueStack = sellingPoints.length ? sellingPoints.join("、") : "好看、实用、多场景可用、价格划算";
+  const audience = draft?.audience || plan.audience || "目标用户";
+  const openingSummary = plan.openingSummary || "先用高停留开头打中目标人群";
+  const scene = plan.sceneHint || productInput.rawUseCases || "日常场景";
+  const hasPromo = /促销|优惠|折扣|活动|买|送|包邮|低价|便宜|price|sale|promo|discount/i.test(productInput.rawSellingPoints || "");
+  return `先用“${openingSummary}”把${audience}留下来，这个${productInput.productName || "产品"}真的可以看看。它不是只靠外观，值感要讲满：${valueStack}。放在${scene}都能用，买几份分开放更划算。${hasPromo ? "把现在的促销信息带上，直接引导下单。" : "现在卖家在做活动，先加购物车会更划算。"}`;
+}
+
+function isMostlyChinese(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  const chineseChars = value.match(/[\u3400-\u9fff]/g)?.length || 0;
+  const latinOrThaiChars = value.match(/[A-Za-z\u0e00-\u0e7f]/g)?.length || 0;
+  if (chineseChars >= 8 && chineseChars >= latinOrThaiChars) return true;
+  return chineseChars >= 12 && chineseChars / Math.max(1, value.length) > 0.25;
 }
 
 function createMockSyncedVoiceover(input) {
@@ -342,6 +655,8 @@ function createMockVideoScripts(input) {
       style: draft.style,
       model: modelName,
       totalDuration,
+      videoTitle: createMockVideoTitle(input.productInput, draft),
+      tags: createMockVideoTags(input.productInput, draft),
       voiceover: draft.voiceover,
       editedZh: draft.editedZh,
       segments: Array.from({ length: segmentCount }, (_, segmentIndex) => ({
@@ -361,6 +676,20 @@ function createMockVideoScripts(input) {
       })),
     };
   });
+}
+
+function createMockVideoTitle(productInput = {}, draft = {}) {
+  const productName = productInput.productName || "produk ni";
+  if (productInput.targetCountry === "马来西亚" || productInput.outputLanguage === "马来语") {
+    return `${productName} kecil tapi rumah terus rasa lain`;
+  }
+  return `${productName} worth it untuk ${draft.audience || "daily use"}`;
+}
+
+function createMockVideoTags(productInput = {}, draft = {}) {
+  const productName = String(productInput.productName || "produk").replace(/\s+/g, "");
+  const style = String(draft.style || "TikTokFinds").replace(/[^\p{L}\p{N}]+/gu, "");
+  return [`#${productName}`, "#TikTokShop", "#ShopeeFinds", `#${style || "WorthIt"}`, "#DailyMustHave"].slice(0, 5);
 }
 
 function parseDurationSeconds(durationText) {
@@ -424,14 +753,24 @@ async function callOpenAI({ system, user, schemaName, schema }) {
     );
   }
 
-  const data = await response.json();
+  const data = await readJsonResponseSafely(response, "OpenAI");
   if (!response.ok) {
-    throw new Error(data.error?.message || "OpenAI API request failed");
+    throw new Error(extractApiErrorMessage(data, response.status, "OpenAI"));
   }
 
   const text = data.output_text || collectOutputText(data);
   if (!text) throw new Error("OpenAI API 没有返回可解析内容");
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(
+      [
+        "OpenAI 返回的内容不是合法 JSON。",
+        `模型返回前 200 字：${String(text || "").slice(0, 200) || "空"}`,
+        `底层错误：${error.message}`,
+      ].join("\n")
+    );
+  }
 }
 
 async function callGemini({ system, user, schemaName, schema }) {
@@ -474,10 +813,10 @@ async function requestGeminiWithRetry(models, payload) {
     for (let attempt = 1; attempt <= Math.max(1, GEMINI_MAX_RETRIES); attempt += 1) {
       try {
         const response = await requestGemini(url, payload);
-        const data = await response.json();
+        const data = await readJsonResponseSafely(response, "Gemini");
         if (response.ok) return data;
 
-        const message = data.error?.message || "Gemini API request failed";
+        const message = extractApiErrorMessage(data, response.status, "Gemini");
         const retryable = response.status === 429 || response.status === 500 || response.status === 503 || isGeminiHighDemand(message);
         errors.push(`${model} 第 ${attempt} 次：${message}`);
         if (!retryable || attempt === GEMINI_MAX_RETRIES) break;
@@ -703,9 +1042,49 @@ function parseHttpResponse(buffer) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: headerMap,
     json: async () => JSON.parse(text || "{}"),
     text: async () => text,
   };
+}
+
+async function readJsonResponseSafely(response, providerName) {
+  try {
+    return await response.json();
+  } catch (error) {
+    const rawText = typeof response.text === "function" ? await response.text().catch(() => "") : "";
+    const compactText = String(rawText || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240);
+    const contentType =
+      response.headers?.get?.("content-type") ||
+      response.headers?.["content-type"] ||
+      "unknown";
+    throw new Error(
+      [
+        `${providerName} API 返回了非 JSON 响应。`,
+        `HTTP 状态：${response.status || "unknown"}`,
+        `Content-Type：${contentType}`,
+        compactText ? `响应内容：${compactText}` : "响应内容为空。",
+        "这通常表示上游接口超时、网关报错、代理/中转返回了错误页，或 OpenAI 兼容地址并未真正返回 JSON。",
+      ].join("\n")
+    );
+  }
+}
+
+function extractApiErrorMessage(data, status, providerName) {
+  const message =
+    data?.error?.message ||
+    data?.message ||
+    data?.detail ||
+    data?.error ||
+    "";
+  const normalized = String(message || "").trim();
+  if (/error code:\s*524|524/i.test(normalized)) {
+    return `${providerName} 上游网关超时（HTTP 524）。通常是模型接口、中转地址或代理超时，不是脚本生成逻辑错误。请稍后重试，或检查 OPENAI_BASE_URL / 代理配置。`;
+  }
+  return normalized || `${providerName} API request failed (HTTP ${status || "unknown"})`;
 }
 
 function decodeChunkedBody(buffer) {
@@ -731,11 +1110,16 @@ function buildPrompt(input) {
       task: "点击 AI 提炼卖点后，生成进入短视频方案前的确认页数据。",
       requirements: [
         "根据产品名称、核心卖点、卖点/促销信息、使用场景、目标人群、目标国家、指定语言、竞品备注推导。",
-        "productInput.rawCoreSellingPoints 是必须在后续口播中讲到的核心卖点，生成 sellingPoints 时必须优先保留并标为主项。",
+        "productInput.rawCoreSellingPoints 是必须在后续视频中真实呈现的关键点，生成 sellingPoints 时必须优先保留并标为主项。",
         "productInput.rawSellingPoints 是补充卖点/促销信息/规格/套装/价格优势，用来扩展卖点池、CTA 和值感表达。",
         "productInput.referenceCopies 最多 3 条，是用户提供的参考文案。需要学习其开头 hook、卖点叠加顺序、情绪/网感、CTA 强度和句式节奏，但不得直接照抄原句。",
-        "如果参考文案里有明显的高转化表达结构，要在 planStrategies 的 angle、competitorAnalysis 的 hook/sellingExpression/cta 中吸收其结构。",
-        "目标人群和痛点要服务于每条生成方案，允许部分重复，但不要无依据乱写。",
+        "如果参考文案里有明显的高转化表达结构，要在 planStrategies 的 angle、openingHooks 和 competitorAnalysis 的 hook/sellingExpression/cta 中吸收其结构。",
+        "目标人群和开头切入要服务于每条生成方案，允许部分重复，但不要无依据乱写。",
+        "openingHooks 用来替代单纯的痛点审核，必须优先思考怎样增加停留、怎样在前 1-3 秒打中目标人群。",
+        "openingHooks.hookType 必须优先从这些方向中选择或组合：引起共鸣、引起好奇、引起恐惧/避坑、引起向往、引起满足。",
+        "不要把所有视频都写成痛点型开头；不同产品、人群、价格带、流量目标应该匹配不同开头切法。",
+        "openingHooks.summary 必须具体描述第一眼画面/话术如何留人，不能只写抽象词。",
+        "openingHooks.stayReason 必须说明为什么这个切法能提高停留，openingHooks.targetAudience 必须明确命中的人群。",
         "planStrategies 数量必须等于 planCount，最多 10 条。",
         "如果用户选择了风格，优先使用 selectedStyles；如果没选，从风格库自动组合。",
         "所有面向用户编辑的字段用中文输出，后续生成脚本时再输出指定语言。",
@@ -772,11 +1156,11 @@ function buildCopyPrompt(input) {
   const confirmedCopyBrief = buildConfirmedCopyBrief(input);
   return JSON.stringify(
     {
-      task: "根据已确认的卖点、人群、痛点、场景和方案策略卡，生成 12-30 秒 TikTok 带货口播文案。",
+      task: "根据已确认的卖点、人群、开头切入和方案策略卡，生成 12-30 秒 TikTok 带货口播文案。",
       copyStandard: {
         duration: "12-30 秒",
         structure: "吸引目标人群注意开头 + 多卖点叠加 + 呼吁下单",
-        openingGoal: "解决用户为什么看下去",
+        openingGoal: "解决用户为什么看下去，优先增加停留并打中目标人群",
         middleGoal: "解决用户为什么买：尽可能自然叠加多个卖点，让顾客感觉这个东西功能多、场景多、价格划算，非常值。",
         endingGoal: "解决用户为什么现在买",
         localization:
@@ -786,13 +1170,16 @@ function buildCopyPrompt(input) {
       outputRules: [
         "每个 planStrategy 生成 1 条文案。",
         "voiceover 使用 productInput.outputLanguage 对应语言。",
-        "voiceoverZh 是自然中文翻译。",
-        "editedZh 初始等于 voiceoverZh，供用户后续微调。",
+        "voiceoverZh 必须是简体中文自然翻译，只能使用中文，不得输出目标语言、泰语、马来语、英语或拼音。",
+        "editedZh 初始必须完全等于 voiceoverZh，供用户后续微调；即使指定输出语言不是中文，editedZh 也必须是中文。",
+        "如果目标语言是泰语、马来语、英语等，仍然只有 voiceover 字段使用目标语言，voiceoverZh/editedZh 绝不能跟随目标语言。",
         "如果 productInput.referenceCopies 有内容，必须学习参考文案的 hook 类型、句子节奏、卖点叠加方式、CTA 力度和网感表达，但不能复制原句或只替换产品名。",
         "参考文案只作为表达结构和转化方式的学习样本；必须重新结合当前产品、目标人群、目标国家和核心卖点生成新文案。",
         "confirmedCopyBrief 是用户在第二屏确认/修改后的最终文案生成依据，必须优先于第一页原始输入。",
-        "每条文案必须基于 confirmedCopyBrief.perPlanBriefs 中对应方案生成，不得脱离第二屏确认后的风格、人群、痛点、场景和卖点池。",
-        "每条文案必须优先覆盖 confirmedCopyBrief.requiredCoreSellingPoints，不得遗漏用户明确填写或第二屏标为主项的核心卖点。",
+        "每条文案必须基于 confirmedCopyBrief.perPlanBriefs 中对应方案生成，不得脱离第二屏确认后的风格、人群、开头切入和卖点池。",
+        "开头第一句必须优先服务停留，不要急着介绍产品；先让目标用户觉得“这是在说我”或“我想继续看”。",
+        "如果 perPlanBrief.hookType 是引起共鸣，优先命中高频困扰和精准人群；如果是引起好奇，优先做反差、未完成动作、效果对比、开箱或反直觉；如果是引起恐惧/避坑，优先做用户教育和踩坑提醒；如果是引起向往，优先做身份代入和理想生活投射；如果是引起满足，优先做爽感、整理前后或治愈感。",
+        "每条文案必须优先覆盖 confirmedCopyBrief.requiredCoreSellingPoints，不得遗漏用户明确填写或第二屏标为主项的必须视频呈现点。",
         "每条文案必须使用对应 perPlanBrief.mustMentionSellingPoints 和 perPlanBrief.valueStack；如果 valueStack 超过 5 个，至少自然讲到 4 个。",
         "除核心卖点外，必须从补充卖点、使用场景、规格、价格优势或促销信息中继续叠加，形成“太值了”的感觉。",
         "卖点叠加要像真实 TikTok 口播，不要机械罗列；可以用短句、并列句、场景化表达把多个卖点连起来。",
@@ -835,7 +1222,7 @@ function buildConfirmedCopyBrief(input) {
     .filter(Boolean);
   const confirmedUseCases = (aiAnalysis.useCases || []).map((item) => item.scene).filter(Boolean);
   const confirmedAudiences = (aiAnalysis.audiences || []).map((item) => item.name || item.motivation).filter(Boolean);
-  const confirmedPainPoints = (aiAnalysis.painPoints || []).map((item) => item.pain).filter(Boolean);
+  const confirmedOpeningHooks = (aiAnalysis.openingHooks || []).map((item) => item.summary || item.hookType).filter(Boolean);
   const promotionInfo = userSellingAndPromoPoints.filter((point) =>
     /促销|优惠|折扣|活动|买|送|包邮|低价|便宜|划算|套装|赠品|price|sale|promo|discount/i.test(point)
   );
@@ -851,7 +1238,7 @@ function buildConfirmedCopyBrief(input) {
     instruction: "先整合第二屏卖点确认结果，再按文案结构生成口播。",
     confirmedSellingPoints,
     confirmedAudiences,
-    confirmedPainPoints,
+    confirmedOpeningHooks,
     confirmedUseCases,
     requiredCoreSellingPoints,
     supplementarySellingPoints: uniqueItems([...userSellingAndPromoPoints, ...confirmedSellingPointTexts]).slice(0, 12),
@@ -867,16 +1254,18 @@ function buildConfirmedCopyBrief(input) {
         planNo: plan.planNo || index + 1,
         style: plan.style || "",
         audience: plan.audience || "",
-        painPoint: plan.painPoint || "",
-        scene: plan.scene || "",
-        hookGoal: "开头用目标人群或痛点让用户愿意继续看。",
+        hookType: plan.hookType || "",
+        openingSummary: plan.openingSummary || "",
+        openingDetail: plan.openingDetail || "",
+        sceneHint: plan.sceneHint || "",
+        hookGoal: "开头先提高停留，再用目标人群和开头切入让用户愿意继续看。",
         buyGoal: "中段用确认后的卖点池做值感堆叠，让用户觉得值得买。",
         ctaGoal: promotionInfo.length ? "结尾使用用户提供的促销/价格/套装信息催单。" : "结尾使用宽泛但自然的活动理由催单。",
         mustMentionSellingPoints: requiredCoreSellingPoints,
         valueStack: rotated,
         ctaSource: promotionInfo.length ? promotionInfo : ["现在卖家在做活动", "现在入手更划算", "趁活动还在先加购物车"],
         writingInstruction:
-          "严格按“吸引目标群体注意开头 + 卖点叠加 + 呼吁下单”生成；中段必须围绕 valueStack 做自然口播式卖点叠加，不要像项目符号。",
+          "严格按“吸引目标群体注意开头 + 卖点叠加 + 呼吁下单”生成；开头必须优先服务停留和人群命中；中段必须围绕 valueStack 做自然口播式卖点叠加，不要像项目符号。",
       };
     }),
   };
@@ -895,6 +1284,44 @@ function rotateItems(items, offset) {
   return [...items.slice(start), ...items.slice(0, start)];
 }
 
+function normalizeVideoScripts(scripts = []) {
+  return (Array.isArray(scripts) ? scripts : []).map((script) => ({
+    ...script,
+    segments: (script.segments || []).map((segment) => normalizeVideoSegment(segment, script.model)),
+  }));
+}
+
+function normalizeVideoSegment(segment = {}, model = "") {
+  const normalizedModel = String(model || "").toLowerCase();
+  return {
+    ...segment,
+    referencePrompt: normalizePromptBlock(segment.referencePrompt || ""),
+    videoPrompt: normalizeSegmentVideoPrompt(segment.videoPrompt || "", normalizedModel === "veo"),
+  };
+}
+
+function normalizePromptBlock(text = "") {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeSegmentVideoPrompt(text = "", keepReferenceField = false) {
+  let normalized = normalizePromptBlock(text)
+    .replace(/镜头\s*(\d+)\s*[:：]\s*/g, "\n镜头$1：\n")
+    .replace(/【参考图】/g, "\n【参考图】")
+    .replace(/【动态内容】/g, "\n【动态内容】")
+    .replace(/【镜头运动】/g, "\n【镜头运动】")
+    .replace(/【口播\/字幕】/g, "\n【口播/字幕】");
+
+  if (!keepReferenceField) {
+    normalized = normalized.replace(/\n【参考图】[^\n]*/g, "");
+  }
+
+  return normalized.replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function buildSyncCopyPrompt(input) {
   return JSON.stringify(
     {
@@ -904,7 +1331,7 @@ function buildSyncCopyPrompt(input) {
         "本土化体现在表达方式、语气、生活细节和消费动机，不要通过硬加国籍标签实现。",
         "不得无意义加入“马来西亚人/大马人/新加坡人/本地人”等称呼，除非中文微调稿明确要求。",
         "保留中文微调稿里的卖点顺序、购买理由、CTA 和语气强度。",
-        "如果中文微调稿包含多个卖点叠加、核心卖点或促销信息，目标语言口播必须完整保留这种值感，不要压缩成单一卖点。",
+        "如果中文微调稿包含多个卖点叠加、必须视频呈现点或促销信息，目标语言口播必须完整保留这种值感，不要压缩成单一卖点。",
         "长度控制在 12-30 秒口播。",
         "开头抓目标人群注意，中间卖点叠加，结尾呼吁下单。",
         "避免当地文化、宗教禁忌；避免夸张承诺除菌、治病、永久除味。",
@@ -926,14 +1353,15 @@ function buildScriptPrompt(input) {
       task: "根据最终保留的口播文案，生成给 Sora/Veo 使用的 AI 视频脚本提示词。",
       modelRules: {
         selectedModel: input.videoModel,
-        sora: "每段视频 12 秒；每段只能 1 张参考图，因此参考图 prompt 需要是拼图参考图，包含 3-5 个关键画面。",
-        veo: "每段视频 10 秒；每段最多 3 张参考图。",
-        segmentation: "根据每条口播文案时长拆成尽可能少的段数。",
-        shotsPerSegment: "每段 10-12 秒控制在 3-5 个镜头。",
-        referenceCount: "参考图尽量只用 1-3 张。",
+        sora: "每段视频最长 12 秒；每段默认 1 张参考图，只有信息密度明显不足时再补充。",
+        veo: "每段视频最长 10 秒；每段可使用 1-3 张参考图。",
+        segmentation: "必须先判断目标语言口播长度，再按自然停顿和句意拆段，任何一段都不能超过模型单段视频时长上限。",
+        shotsPerSegment: "每段控制在 2-4 个镜头说明，按段输出，不要每个镜头单独生成一份完整 prompt。",
+        referenceCount: "Sora 每段默认 1 张；Veo 每段 1-3 张，按该段信息量决定。",
       },
       visualRules: [
         "参考图 prompt 要提高画面信息密度：不要只有单一产品大图，画面中应同时包含产品、包装/配件/使用前后状态、人物动作、场景背景、真实生活或工作环境细节。",
+        "productInput.rawCoreSellingPoints 是必须在视频中真实呈现的点，生成参考图和视频 prompt 时必须逐段落实到画面、动作、前后对比、使用状态或场景细节里，不能只停留在口播里。",
         "画面真实感优先：模拟手机拍摄、普通人/工厂/仓库/家庭环境、自然杂乱、轻微不完美，不要像棚拍广告大片。",
         "如果方案风格是“工厂/老板视角”，画面应优先包含工厂打包现场、堆叠纸箱、工人操作、老板/厂长拿产品口播、真实小插曲或忙碌背景，让用户感觉正在看到源头现场。",
         "工厂/老板视角可以使用戏剧化但真实的场面调度，例如老板边走边介绍、工人打包、背景有人争论、产品包装/使用效果同屏展示，但不要过度夸张或像影视片。",
@@ -948,23 +1376,30 @@ function buildScriptPrompt(input) {
           "只有当方案风格为工厂/老板视角，或产品适合源头工厂、发货、补货、质量解释、售后承诺、爆款补货等话题时使用。",
       },
       referencePromptFormat: [
-        "【参考图编号】模型-第 X 段-第 X 镜头",
-        "【画面主体】描述人物/产品/场景；画面信息密度要高，尽量同时出现产品、包装、使用状态、环境细节和人物动作；凡是描述产品外观、颜色、形状、包装、材质、图案、挂钩、尺寸等产品细节，必须写“产品如图所示”或“产品外观如产品参考图所示”。",
-        "【人物与动作】人物是谁，符合目标国家真实 TikTok 用户的自然外貌与生活状态；描述皮肤、发型、五官、表情、姿势、动作，但不要用刻板印象或国籍标签；人物展示或使用产品时必须注明产品如图所示；如果是工厂/老板视角，要描述老板/厂长/工人之间的动作关系和现场忙碌感。",
-        "【场景与本土化】目标国家生活环境；如果是工厂/老板视角，要描述真实工厂、仓库、打包区、纸箱堆、产品包装、工人坐在地上打包或忙碌工作等细节。",
-        "【画面风格】真实手机拍摄、TikTok UGC、自然光、不像广告大片；画面可以有轻微手持感、生活杂乱和真实现场感。",
-        "【构图】竖屏 9:16，近景/中景/俯拍/手部特写等。",
-        "【避免】不要夸张香味烟雾，不要产品变形，不要改变产品颜色/形状/包装，不要假，不要欧美豪宅背景。",
+        "参考图 prompt 必须一段一个，不要一个镜头一个。",
+        "开头先写：生成X张参考图。",
+        "然后固定输出【画面风格】【构图】【避免】。",
+        "接着按顺序写：第1张：... 第2张：... 第3张：...",
+        "每一张都要明确这一张里呈现的产品状态、人物动作、场景、以及这一张负责承接的必须视频呈现点。",
       ],
       videoPromptFormat: [
-        "【模型】Sora / Veo",
-        "【段落与镜头】第 X 段，第 X 镜头，时长 X 秒。",
-        "【参考图】分镜图 X",
-        "【动态内容】描述视频中发生什么动作。",
-        "【镜头运动】手持轻微晃动 / 慢推近 / 轻微横移 / 定机位 / 第一人称视角",
-        "【口播/字幕】该段对应的目标语言口播和字幕，严格按照上一个阶段生成的文案。",
-        "【风格】真实 TikTok UGC，本土生活感，手机拍摄。",
-        "【约束】保持产品形状一致，画质风格接地气，不改变产品，不生成夸张，不加入无关人物，不出现乱码文字。",
+        "视频 prompt 必须一段一个，不要按镜头拆成多份 prompt。",
+        "开头固定输出【风格】【镜头】【约束】。",
+        "Veo 的镜头按顺序写：镜头1：{【参考图】【动态内容】【镜头运动】【口播/字幕】}，镜头2：...",
+        "Sora 因为每段通常只有 1 张参考图，所以镜头里不要重复写【参考图】字段，只写【动态内容】【镜头运动】【口播/字幕】。",
+        "为了后续复制到飞书表格里更易读，每个镜头块必须换行书写，不要把镜头1、镜头2压成一整长行。",
+        "镜头里的口播/字幕必须只使用该段对应的目标语言文案片段，不要把整条口播重复塞进每个镜头。",
+      ],
+      outputStructure: [
+        "每条脚本都必须输出 videoTitle（目标语言）和 tags（3-5 个）。",
+        "videoTitle 要像当地 TikTok 热门标题，能勾起点击或继续看下去的欲望。",
+        "tags 要覆盖产品、场景、风格或购买动机，避免无关热词堆砌。",
+      ],
+      titleAndTagRules: [
+        "每条脚本必须生成 videoTitle：使用 productInput.outputLanguage 对应语言，适合目标国家 TikTok 用户，能制造好奇或利益点，吸引用户继续看。",
+        "videoTitle 不要用生硬国籍标签假装本土化，不要虚假承诺，不要夸张医疗/除菌效果。",
+        "每条脚本必须生成 tags：3-5 个当地 TikTok 可用 tag，可包含 #TikTokShop、产品类目、使用场景、风格或购买动机。",
+        "tags 要服务于搜索和转化，不要堆无关热门词。",
       ],
       productInput: input.productInput,
       aiAnalysis: input.aiAnalysis,
@@ -990,12 +1425,19 @@ function scriptSchema(scriptCount = 1) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["planNo", "style", "model", "totalDuration", "voiceover", "editedZh", "segments"],
+          required: ["planNo", "style", "model", "totalDuration", "videoTitle", "tags", "voiceover", "editedZh", "segments"],
           properties: {
             planNo: { type: "number" },
             style: stringField,
             model: stringField,
             totalDuration: { type: "number" },
+            videoTitle: stringField,
+            tags: {
+              type: "array",
+              minItems: 3,
+              maxItems: 5,
+              items: stringField,
+            },
             voiceover: stringField,
             editedZh: stringField,
             segments: {
@@ -1005,11 +1447,15 @@ function scriptSchema(scriptCount = 1) {
               items: {
                 type: "object",
                 additionalProperties: false,
-                required: ["segmentNo", "duration", "referenceMode", "shots"],
+                required: ["segmentNo", "duration", "referenceCount", "segmentVoiceover", "segmentEditedZh", "referencePrompt", "videoPrompt", "shots"],
                 properties: {
                   segmentNo: { type: "number" },
                   duration: { type: "number" },
-                  referenceMode: stringField,
+                  referenceCount: { type: "number" },
+                  segmentVoiceover: stringField,
+                  segmentEditedZh: stringField,
+                  referencePrompt: stringField,
+                  videoPrompt: stringField,
                   shots: {
                     type: "array",
                     minItems: 1,
@@ -1017,12 +1463,14 @@ function scriptSchema(scriptCount = 1) {
                     items: {
                       type: "object",
                       additionalProperties: false,
-                      required: ["shotNo", "duration", "referenceImagePrompt", "videoPrompt"],
+                      required: ["shotNo", "duration", "referenceRef", "dynamicContent", "cameraMovement", "subtitle"],
                       properties: {
                         shotNo: { type: "number" },
                         duration: { type: "number" },
-                        referenceImagePrompt: stringField,
-                        videoPrompt: stringField,
+                        referenceRef: stringField,
+                        dynamicContent: stringField,
+                        cameraMovement: stringField,
+                        subtitle: stringField,
                       },
                     },
                   },
@@ -1043,6 +1491,34 @@ function syncCopySchema() {
     required: ["voiceover"],
     properties: {
       voiceover: { type: "string" },
+    },
+  };
+}
+
+function chineseCopyRepairSchema(count = 1) {
+  const maxItems = Math.max(1, Math.min(Number(count) || 1, 10));
+  const stringField = { type: "string" };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["repairedDrafts"],
+    properties: {
+      repairedDrafts: {
+        type: "array",
+        minItems: maxItems,
+        maxItems,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["index", "planNo", "voiceoverZh", "editedZh"],
+          properties: {
+            index: { type: "number" },
+            planNo: { type: "number" },
+            voiceoverZh: stringField,
+            editedZh: stringField,
+          },
+        },
+      },
     },
   };
 }
@@ -1102,7 +1578,7 @@ function analysisSchema(planCount = 5) {
     required: [
       "sellingPoints",
       "audiences",
-      "painPoints",
+      "openingHooks",
       "useCases",
       "planStrategies",
       "competitorVideoAnalyses",
@@ -1141,17 +1617,20 @@ function analysisSchema(planCount = 5) {
           },
         },
       },
-      painPoints: {
+      openingHooks: {
         type: "array",
         minItems: 1,
         maxItems: 10,
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["pain", "emotion", "videoExpression", "priority"],
+          required: ["hookType", "summary", "stayReason", "targetAudience", "sceneHint", "videoExpression", "priority"],
           properties: {
-            pain: stringField,
-            emotion: stringField,
+            hookType: stringField,
+            summary: stringField,
+            stayReason: stringField,
+            targetAudience: stringField,
+            sceneHint: stringField,
             videoExpression: stringField,
             priority: { type: "number" },
           },
@@ -1179,13 +1658,15 @@ function analysisSchema(planCount = 5) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["planNo", "style", "audience", "painPoint", "scene", "angle"],
+          required: ["planNo", "style", "audience", "hookType", "openingSummary", "openingDetail", "sceneHint", "angle"],
           properties: {
             planNo: { type: "number" },
             style: stringField,
             audience: stringField,
-            painPoint: stringField,
-            scene: stringField,
+            hookType: stringField,
+            openingSummary: stringField,
+            openingDetail: stringField,
+            sceneHint: stringField,
             angle: stringField,
           },
         },

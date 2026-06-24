@@ -5,7 +5,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check app.js"
+    "check": "node --check server.js && node --check app.js && node --check feishu.js && node --check test-feishu.js",
+    "test:feishu": "node test-feishu.js",
+    "mock:feishu-export": "node mock-feishu-export.js"
   },
   "engines": {
     "node": ">=20"

@@ -5,7 +5,10 @@ const state = {
   selectedCopyDrafts: [],
   videoScripts: [],
   selectedVideoModel: "sora",
+  pendingFeishuExport: false,
 };
+
+const FEISHU_CONFIG_STORAGE_KEY = "ai_tiktok_tool_feishu_config";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -159,6 +162,10 @@ $("#regenerateCopy").addEventListener("click", () => {
   runCopyGeneration();
 });
 
+$("#syncSelectedCopy").addEventListener("click", () => {
+  syncSelectedEditedCopiesToVoiceover();
+});
+
 $("#confirmCopy").addEventListener("click", () => {
   syncCopyDraftsFromDom();
   state.selectedCopyDrafts = state.copyDrafts.filter((draft) => draft.selected);
@@ -176,8 +183,61 @@ $("#generateScripts").addEventListener("click", () => {
   runScriptGeneration();
 });
 
+$("#openFeishuConfig")?.addEventListener("click", () => {
+  openFeishuConfigDialog({ exportAfterSave: false });
+});
+
+$("#exportToFeishu")?.addEventListener("click", () => {
+  exportSelectedScriptsToFeishu();
+});
+
 $("#closeDialog").addEventListener("click", () => {
   $("#nextStepDialog").close();
+});
+
+$("#cancelFeishuConfig")?.addEventListener("click", () => {
+  state.pendingFeishuExport = false;
+  $("#feishuConfigDialog")?.close();
+});
+
+$("#feishuConfigForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const config = collectFeishuConfigFromForm();
+    saveFeishuConfig(config);
+    $("#feishuConfigDialog")?.close();
+    if (state.pendingFeishuExport) {
+      state.pendingFeishuExport = false;
+      await exportSelectedScriptsToFeishu();
+    } else {
+      alert("飞书配置已保存。");
+    }
+  } catch (error) {
+    alert(error.message || "飞书配置保存失败。");
+  }
+});
+
+$("#testFeishuConfig")?.addEventListener("click", async () => {
+  const button = $("#testFeishuConfig");
+  setButtonLoading(button, true, "测试中...", "测试连接");
+  try {
+    const config = collectFeishuConfigFromForm();
+    saveFeishuConfig(config);
+    const result = await requestFeishuDiagnose({ feishu: config });
+    const lines = [
+      result.ok ? "飞书连接测试成功。" : "飞书连接测试未完全通过。",
+      "",
+      `app token：${result.parsed?.appToken || "未识别"}`,
+      `table id：${result.parsed?.tableId || "链接中未带 table 参数"}`,
+      "",
+      ...((result.steps || []).map((item, index) => `${index + 1}. [${item.ok ? "OK" : "失败"}] ${item.step}\n${item.detail || ""}`)),
+    ];
+    alert(lines.join("\n"));
+  } catch (error) {
+    alert(error.message || "飞书连接测试失败。");
+  } finally {
+    setButtonLoading(button, false, "测试中...", "测试连接");
+  }
 });
 
 $$("[data-add]").forEach((button) => {
@@ -340,6 +400,64 @@ async function syncEditedCopyToVoiceover(index, button) {
   }
 }
 
+async function syncSelectedEditedCopiesToVoiceover() {
+  syncCopyDraftsFromDom();
+  const selectedIndexes = state.copyDrafts
+    .map((draft, index) => (draft.selected ? index : -1))
+    .filter((index) => index >= 0);
+
+  if (!selectedIndexes.length) {
+    alert("请先勾选至少 1 条保留文案。");
+    return;
+  }
+
+  const missingEditedZh = selectedIndexes.find((index) => !state.copyDrafts[index]?.editedZh);
+  if (missingEditedZh != null) {
+    alert(`方案 ${state.copyDrafts[missingEditedZh].planNo} 还没有填写中文微调稿。`);
+    return;
+  }
+
+  const button = $("#syncSelectedCopy");
+  setButtonLoading(button, true, "批量同步中...", "一键同步保留文案到目标语言");
+
+  try {
+    for (const index of selectedIndexes) {
+      const draft = state.copyDrafts[index];
+      const response = await fetch("/api/sync-copy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productInput: state.productInput,
+          draft,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || `方案 ${draft.planNo} 同步目标语言口播失败`);
+      }
+      state.copyDrafts[index] = {
+        ...draft,
+        voiceover: data.voiceover || draft.voiceover,
+      };
+    }
+
+    const cards = $$(".copy-card");
+    selectedIndexes.forEach((index) => {
+      const card = cards[index];
+      const voiceoverField = card?.querySelector('[data-copy-field="voiceover"]');
+      if (voiceoverField) {
+        voiceoverField.value = state.copyDrafts[index].voiceover;
+      }
+    });
+    alert(`已同步 ${selectedIndexes.length} 条保留文案到目标语言。`);
+  } catch (error) {
+    console.error(error);
+    alert(error.message || "批量同步目标语言口播失败。");
+  } finally {
+    setButtonLoading(button, false, "批量同步中...", "一键同步保留文案到目标语言");
+  }
+}
+
 function normalizeCopyDrafts(copyDrafts, productInput, aiAnalysis) {
   const fallback = generateMockCopyDrafts(productInput, aiAnalysis);
   const drafts = Array.isArray(copyDrafts) && copyDrafts.length ? copyDrafts : fallback;
@@ -362,7 +480,8 @@ function normalizeAiAnalysis(analysis, productInput) {
   return {
     sellingPoints: Array.isArray(analysis?.sellingPoints) && analysis.sellingPoints.length ? analysis.sellingPoints : localFallback.sellingPoints,
     audiences: Array.isArray(analysis?.audiences) && analysis.audiences.length ? analysis.audiences : localFallback.audiences,
-    painPoints: Array.isArray(analysis?.painPoints) && analysis.painPoints.length ? analysis.painPoints : localFallback.painPoints,
+    openingHooks:
+      Array.isArray(analysis?.openingHooks) && analysis.openingHooks.length ? analysis.openingHooks : localFallback.openingHooks,
     useCases: Array.isArray(analysis?.useCases) && analysis.useCases.length ? analysis.useCases : localFallback.useCases,
     planStrategies:
       Array.isArray(analysis?.planStrategies) && analysis.planStrategies.length
@@ -423,14 +542,14 @@ function generateMockAnalysis(input) {
   const sellingPoints = buildSellingPoints([...sourceCoreSellingPoints, ...sourceSellingPoints], defaults.sellingPoints, input, sourceCoreSellingPoints.length);
   const useCases = buildUseCases(sourceUseCases, defaults.useCases, input);
   const audiences = buildAudiences(sourceAudiences, defaults.audiences, category, insightText);
-  const painPoints = buildPainPoints(defaults.painPoints, category, insightText);
+  const openingHooks = buildOpeningHooks(defaults.openingHooks, category, insightText, useCases, audiences);
 
   return {
     sellingPoints,
     audiences,
-    painPoints,
+    openingHooks,
     useCases,
-    planStrategies: generatePlanStrategies(input, audiences, painPoints, useCases),
+    planStrategies: generatePlanStrategies(input, audiences, openingHooks, useCases),
     competitorVideoAnalyses: input.competitorVideos.map((video, index) => ({
       name: video.name || video,
       status: "待视频模型解析",
@@ -442,14 +561,14 @@ function generateMockAnalysis(input) {
     competitorAnalysis: hasCompetitor
       ? {
           hook: inferCompetitorHook(input),
-          sellingExpression: inferSellingExpression(sellingPoints, painPoints),
+          sellingExpression: inferSellingExpression(sellingPoints, openingHooks),
           originalCopy: input.competitorNotes || "已上传竞品参考，待视频理解模型提取原视频文案。",
           originalCopyZh: input.competitorNotes || "已上传竞品参考，待视频理解模型提取原视频文案并翻译。",
           cta: inferCta(input.competitorNotes),
         }
       : {
           hook: "未上传竞品参考，本次分析基于产品信息和目标市场生成。",
-          sellingExpression: "围绕产品卖点、人群痛点和使用场景进行表达。",
+          sellingExpression: "围绕产品卖点、目标人群和高停留开头切入进行表达。",
           originalCopy: input.referenceCopies?.[0] || "未上传竞品参考。",
           originalCopyZh: input.referenceCopies?.[0] || "未上传竞品参考。",
           cta: input.referenceCopies?.length ? "学习参考文案里的 CTA 强度和下单理由，但不照抄。" : "根据价格和活动信息补充购买引导。",
@@ -477,15 +596,16 @@ function generateMockCopyDrafts(productInput, aiAnalysis) {
       : productInput.targetCountry === "马来西亚"
         ? "Seller tengah buat promo, jangan tunggu lama."
         : "Seller is running a deal now, add to cart first.";
+    const openingLine = strategy.openingLine || `Kalau ${strategy.audience} terus rasa “${strategy.openingSummary || strategy.hookType}”, tengok ni.`;
     return {
       planNo: strategy.planNo,
       style: strategy.style,
       audience: strategy.audience,
       duration: "20-30s",
-      hook: `Kalau ${strategy.audience} selalu ada masalah ${strategy.painPoint}, tengok ni.`,
-      voiceover: `Kalau ${strategy.audience} selalu rasa ${strategy.painPoint}, produk kecil ni memang kena cuba. Nilai dia banyak: ${valueStackMs}. Sesuai letak dekat ${strategy.scene}, boleh beli beberapa pek untuk tempat berbeza, rasa macam sangat berbaloi untuk harga dia. ${nowReason}`,
-      voiceoverZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。它的值感要讲满：${valueStackZh}。适合${strategy.scene}，还可以买几包放在不同位置，给人感觉这个价格能解决好多小问题。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
-      editedZh: `如果${strategy.audience}经常遇到“${strategy.painPoint}”，这个小产品真的可以试。它的值感要讲满：${valueStackZh}。适合${strategy.scene}，还可以买几包放在不同位置，给人感觉这个价格能解决好多小问题。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
+      hook: openingLine,
+      voiceover: `${openingLine} Nilai dia banyak: ${valueStackMs}. Sesuai untuk ${strategy.sceneHint || strategy.audience}, boleh terus nampak perubahan dekat ${strategy.sceneHint || "daily routine"}. ${nowReason}`,
+      voiceoverZh: `${strategy.openingSummary || `先用${strategy.hookType || "开头切入"}抓住${strategy.audience}`}。它的值感要讲满：${valueStackZh}。画面里直接放到${strategy.sceneHint || "真实生活流程"}里，让人一眼看到改善。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
+      editedZh: `${strategy.openingSummary || `先用${strategy.hookType || "开头切入"}抓住${strategy.audience}`}。它的值感要讲满：${valueStackZh}。画面里直接放到${strategy.sceneHint || "真实生活流程"}里，让人一眼看到改善。${hasPromo ? "有促销信息就直接带上。" : "现在卖家在做活动，别等太久。"}`,
       cta: nowReason,
       selected: true,
     };
@@ -496,24 +616,39 @@ function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
   const modelName = videoModel === "veo" ? "Veo" : "Sora";
   const segmentDuration = videoModel === "veo" ? 10 : 12;
   return copyDrafts.map((draft) => {
-    const estimatedDuration = parseDurationSeconds(draft.duration) || 24;
-    const segmentCount = Math.max(1, Math.ceil(estimatedDuration / segmentDuration));
-    const segments = Array.from({ length: segmentCount }, (_, segmentIndex) => {
-      const shots = Array.from({ length: videoModel === "veo" ? 3 : 4 }, (_, shotIndex) => {
-        const shotNo = shotIndex + 1;
-        const refNo = `${modelName}-第 ${segmentIndex + 1} 段-第 ${shotNo} 镜头`;
-        return {
-          shotNo,
-          duration: Math.max(2, Math.round(segmentDuration / (videoModel === "veo" ? 3 : 4))),
-          referenceImagePrompt: `【参考图编号】\n${refNo}\n\n【画面主体】\n${productInput.productName} 在真实生活场景中出现，画面信息密度高，同时能看到产品、包装/配件、使用环境和人物动作；产品外观、颜色、形状、包装、图案和细节如产品参考图所示。\n\n【人物与动作】\n真实 TikTok 用户或老板/工厂人员，穿着日常，肤色、发型和五官自然，表情放松，正在展示或使用产品，产品如图所示；如果是工厂/老板视角，老板拿着产品走向镜头，背景工人正在打包或搬纸箱，现场有真实忙碌感。\n\n【场景与本土化】\n普通家庭空间、仓库或工厂打包区，通过衣柜、车内、洗手间、客厅、纸箱堆、包装台、工人动作等细节体现真实场景；产品摆放和使用方式如产品参考图所示。\n\n【画面风格】\n真实手机拍摄、TikTok UGC、自然光、不像广告大片；允许轻微手持晃动、自然杂乱和现场不完美。\n\n【构图】\n竖屏 9:16，中近景或手部特写；可以做拼图/多宫格参考，让包装、使用状态和效果对比同屏出现。\n\n【避免】\n不要夸张香味烟雾，不要产品变形，不要改变产品颜色/形状/包装，不要假 logo，不要欧美豪宅背景。`,
-          videoPrompt: `【模型】\n${modelName}\n\n【段落与镜头】\n第 ${segmentIndex + 1} 段，第 ${shotNo} 镜头，时长 ${Math.max(2, Math.round(segmentDuration / (videoModel === "veo" ? 3 : 4)))} 秒。\n\n【参考图】\n分镜图 ${shotNo}，画面和产品如分镜图 ${shotNo} 所示。\n\n【动态内容】\n人物自然展示 ${productInput.productName}，把产品放到真实生活场景中，强化“${draft.audience}”的购买理由。\n\n【镜头运动】\n手持轻微晃动，慢推近，真实第一人称视角。\n\n【口播/字幕】\n${draft.voiceover}\n\n【风格】\n真实 TikTok UGC，本土生活感，手机拍摄。\n\n【约束】\n保持产品形状一致，画质风格接地气，不改变产品，不生成夸张，不加入无关人物，不出现乱码文字。`,
-        };
-      });
+    const estimatedDuration = estimateVoiceoverDurationSeconds(draft.voiceover, draft.editedZh) || parseDurationSeconds(draft.duration) || 24;
+    const segmentTexts = splitScriptIntoSegments(draft.voiceover, draft.editedZh, segmentDuration);
+    const segments = segmentTexts.map((segmentText, segmentIndex) => {
+      const referenceCount = videoModel === "veo" ? Math.min(3, Math.max(1, segmentText.units.length)) : 1;
+      const shots = segmentText.units.map((unit, shotIndex) => ({
+        shotNo: shotIndex + 1,
+        duration: Math.max(2, Math.round(segmentText.duration / Math.max(1, segmentText.units.length))),
+        referenceRef: `第${Math.min(referenceCount, shotIndex + 1)}张参考图`,
+        dynamicContent: `围绕“${unit.zh || draft.editedZh}”展示 ${productInput.productName} 的真实使用场景，并把“${(productInput.rawCoreSellingPoints || "必须呈现点").split(/[；;，,、]/).filter(Boolean).slice(0, 2).join("、") || "产品关键点"}”落实到画面里。`,
+        cameraMovement: shotIndex % 2 === 0 ? "手持轻微晃动，慢推近。" : "中近景定机位，轻微横移。",
+        subtitle: unit.voiceover || draft.voiceover,
+      }));
       return {
         segmentNo: segmentIndex + 1,
-        duration: segmentDuration,
-        referenceMode:
-          videoModel === "veo" ? "本段最多 3 张参考图，对应 3 个关键镜头。" : "本段使用 1 张拼图参考图，拼入 3-5 个关键画面。",
+        duration: segmentText.duration,
+        referenceCount,
+        segmentVoiceover: segmentText.voiceover,
+        segmentEditedZh: segmentText.zh,
+        referencePrompt: buildSegmentReferencePrompt({
+          productInput,
+          draft,
+          segmentNo: segmentIndex + 1,
+          modelName,
+          referenceCount,
+          units: segmentText.units,
+        }),
+        videoPrompt: buildSegmentVideoPrompt({
+          productInput,
+          draft,
+          segmentNo: segmentIndex + 1,
+          shots,
+          modelName,
+        }),
         shots,
       };
     });
@@ -521,7 +656,9 @@ function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
       planNo: draft.planNo,
       style: draft.style,
       model: modelName,
-      totalDuration: estimatedDuration,
+      totalDuration: Math.max(estimatedDuration, segments.reduce((sum, segment) => sum + segment.duration, 0)),
+      videoTitle: generateMockVideoTitle(productInput, draft),
+      tags: generateMockVideoTags(productInput, draft),
       voiceover: draft.voiceover,
       editedZh: draft.editedZh,
       segments,
@@ -529,10 +666,118 @@ function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
   });
 }
 
+function generateMockVideoTitle(productInput = {}, draft = {}) {
+  const productName = productInput.productName || "produk ni";
+  if (productInput.targetCountry === "马来西亚" || productInput.outputLanguage === "马来语") {
+    return `${productName} kecil tapi rasa berbaloi gila`;
+  }
+  return `${productName} worth it untuk ${draft.audience || "daily use"}`;
+}
+
+function generateMockVideoTags(productInput = {}, draft = {}) {
+  const productName = String(productInput.productName || "produk").replace(/\s+/g, "");
+  const style = String(draft.style || "TikTokFinds").replace(/[^\p{L}\p{N}]+/gu, "");
+  return [`#${productName}`, "#TikTokShop", "#ShopeeFinds", `#${style || "WorthIt"}`, "#DailyMustHave"].slice(0, 5);
+}
+
 function parseDurationSeconds(durationText) {
   const matches = String(durationText || "").match(/\d+/g);
   if (!matches?.length) return 0;
   return Number(matches[matches.length - 1]);
+}
+
+function estimateVoiceoverDurationSeconds(voiceover = "", editedZh = "") {
+  const voiceoverWordCount = String(voiceover || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const zhLength = String(editedZh || "").replace(/\s+/g, "").length;
+  const fromVoiceover = voiceoverWordCount ? Math.ceil(voiceoverWordCount / 2.8) : 0;
+  const fromZh = zhLength ? Math.ceil(zhLength / 5) : 0;
+  return Math.max(fromVoiceover, fromZh, 0);
+}
+
+function splitScriptIntoSegments(voiceover = "", editedZh = "", maxDuration = 12) {
+  const voiceParts = splitScriptUnits(voiceover);
+  const zhParts = splitScriptUnits(editedZh);
+  const count = Math.max(voiceParts.length, zhParts.length, 1);
+  const units = Array.from({ length: count }, (_, index) => ({
+    voiceover: voiceParts[index] || "",
+    zh: zhParts[index] || "",
+  })).filter((unit) => unit.voiceover || unit.zh);
+
+  if (!units.length) {
+    return [{ voiceover: voiceover || "", zh: editedZh || "", duration: Math.max(3, maxDuration), units: [{ voiceover, zh: editedZh }] }];
+  }
+
+  const segments = [];
+  let current = [];
+  let currentDuration = 0;
+
+  units.forEach((unit) => {
+    const unitDuration = Math.max(2, estimateVoiceoverDurationSeconds(unit.voiceover, unit.zh));
+    if (current.length && currentDuration + unitDuration > maxDuration) {
+      segments.push(buildSegmentChunk(current, currentDuration, maxDuration));
+      current = [unit];
+      currentDuration = unitDuration;
+    } else {
+      current.push(unit);
+      currentDuration += unitDuration;
+    }
+  });
+
+  if (current.length) {
+    segments.push(buildSegmentChunk(current, currentDuration, maxDuration));
+  }
+
+  return segments;
+}
+
+function buildSegmentChunk(units, duration, maxDuration) {
+  return {
+    voiceover: units.map((unit) => unit.voiceover).filter(Boolean).join(" "),
+    zh: units.map((unit) => unit.zh).filter(Boolean).join(""),
+    duration: Math.min(maxDuration, Math.max(3, duration)),
+    units,
+  };
+}
+
+function splitScriptUnits(text = "") {
+  return String(text || "")
+    .split(/(?<=[。！？!?；;])|\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildSegmentReferencePrompt({ productInput, draft, segmentNo, modelName, referenceCount, units }) {
+  const mustShowPoints = splitText(productInput.rawCoreSellingPoints).slice(0, 3);
+  const pointText = mustShowPoints.length ? mustShowPoints.join("、") : "产品关键使用点";
+  const imageLines = Array.from({ length: referenceCount }, (_, index) => {
+    const unit = units[Math.min(index, units.length - 1)] || units[0] || {};
+    return `第${index + 1}张：围绕“${unit.zh || draft.editedZh || productInput.productName}”设计画面，产品如图所示，必须把${pointText}通过人物动作、产品状态、使用前后对比或收纳细节真实呈现出来。场景保持 ${draft.style || "真实 TikTok UGC"} 风格，符合 ${productInput.targetCountry || "目标国家"} 日常生活环境。`;
+  });
+  return [
+    `生成${referenceCount}张参考图`,
+    "【画面风格】真实手机拍摄、TikTok UGC、自然光、生活化，不像棚拍广告。",
+    "【构图】竖屏 9:16，中近景、手部特写、前后对比或多宫格拼图，保证产品和动作都清楚。",
+    "【避免】不要改变产品颜色/形状/包装，不要夸张特效，不要欧美豪宅背景，不要假 logo。",
+    ...imageLines,
+  ].join("\n");
+}
+
+function buildSegmentVideoPrompt({ productInput, draft, segmentNo, shots, modelName }) {
+  const isVeo = String(modelName || "").toLowerCase() === "veo";
+  return [
+    "【风格】真实 TikTok UGC，本土生活感，手机拍摄，自然手持感。",
+    `【镜头】第 ${segmentNo} 段共 ${shots.length} 个镜头，围绕 ${productInput.productName} 的使用过程、前后对比和必须呈现点展开。`,
+    "【约束】保持产品外观如图所示，不夸大功效，不添加无关人物，不出现乱码文字。",
+    ...shots.map(
+      (shot) =>
+        isVeo
+          ? `镜头${shot.shotNo}：\n【参考图】${shot.referenceRef}\n【动态内容】${shot.dynamicContent}\n【镜头运动】${shot.cameraMovement}\n【口播/字幕】${shot.subtitle}`
+          : `镜头${shot.shotNo}：\n【动态内容】${shot.dynamicContent}\n【镜头运动】${shot.cameraMovement}\n【口播/字幕】${shot.subtitle}`
+    ),
+  ].join("\n");
 }
 
 function buildSellingPoints(sourceSellingPoints, fallbackItems, input, coreCount = 0) {
@@ -576,10 +821,10 @@ function buildAudiences(sourceAudiences, fallbackItems, category, text) {
   return uniqueByName(pool).slice(0, 6);
 }
 
-function buildPainPoints(defaultPainPoints, category, text) {
-  const inferred = inferPainPointsFromText(text, category);
-  const expanded = expandPainPoints(defaultPainPoints, category);
-  return uniqueByKey([...inferred, ...expanded], "pain").slice(0, 8);
+function buildOpeningHooks(defaultOpeningHooks, category, text, useCases = [], audiences = []) {
+  const inferred = inferOpeningHooksFromText(text, category, useCases, audiences);
+  const expanded = expandOpeningHooks(defaultOpeningHooks, category);
+  return uniqueByKey([...inferred, ...expanded], "summary").slice(0, 8);
 }
 
 function inferAudiencesFromText(text, category) {
@@ -607,27 +852,42 @@ function inferAudiencesFromText(text, category) {
     : [];
 }
 
-function inferPainPointsFromText(text, category) {
+function inferOpeningHooksFromText(text, category, useCases = [], audiences = []) {
+  const sceneHint = useCases[0]?.scene || "真实生活场景";
+  const audienceHint = audiences[0]?.name || "目标人群";
   const rules = [
-    [/打结|缠|找不到|丢|散落/, "东西容易缠在一起或找不到", "出门前着急，越找越乱。", "展示混乱状态，再切到整理后的结果。"],
-    [/乱|凌乱|整理|收纳|空间|小户型|租房/, "空间乱、物品多、不好整理", "看起来拥挤，影响心情和效率。", "用 before/after 对比展示变化。"],
-    [/容量|装不下|分区|包里|小物/, "东西多但装不下或不好拿", "出门准备麻烦，找东西浪费时间。", "用真实装包过程证明容量和分区。"],
-    [/防水|下雨|潮湿|热带/, "天气潮湿或下雨影响使用", "担心产品不耐用、不适合东南亚气候。", "展示雨天、潮湿环境或耐用细节。"],
-    [/贵|价格|便宜|优惠|限时|低价/, "想买但担心价格不划算", "需要一个低风险、值得冲动下单的理由。", "突出价格、活动和即时改善。"],
-    [/送礼|礼物|生日|节日/, "送礼怕不实用或不好看", "担心对方不喜欢，或者礼物显得敷衍。", "展示包装、上手效果和适用人群。"],
-  ];
+    [/打结|缠|找不到|丢|散落/, "引起共鸣", "一上来就拍出门前找不到、拿不顺、越找越乱的瞬间，精准打中需要整理的人。", "先拍混乱状态，再切到产品整理后的结果。", audienceHint],
+    [/乱|凌乱|整理|收纳|空间|小户型|租房/, "引起共鸣", "直接把小空间乱糟糟的画面摆出来，让租房和小户型人群立刻代入。", "用 before/after 对比展示变化。", audienceHint],
+    [/容量|装不下|分区|包里|小物/, "引起好奇", "开头先抛出“这么小怎么装下这么多”的反差，靠装包过程留人。", "用真实装包过程证明容量和分区。", audienceHint],
+    [/防水|下雨|潮湿|热带/, "引起恐惧/避坑", "先点出潮湿闷热环境下最容易踩坑的问题，再引出产品。", "展示雨天、潮湿环境或耐用细节。", audienceHint],
+    [/贵|价格|便宜|优惠|限时|低价/, "引起好奇", "先用低门槛、低风险、现在买更值的角度让用户继续看。", "突出价格、活动和即时改善。", audienceHint],
+    [/送礼|礼物|生日|节日/, "引起向往", "把开头做成收到礼物或准备送礼的理想画面，让用户投射关系和场合。", "展示包装、上手效果和适用人群。", audienceHint],
+    ];
   const matched = rules
     .filter(([pattern]) => pattern.test(text))
-    .map(([, pain, emotion, videoExpression], index) => ({
-      pain,
-      emotion,
+    .map(([, hookType, summary, videoExpression, targetAudience], index) => ({
+      hookType,
+      summary,
+      stayReason: "优先命中目标人群，并在前 1-3 秒制造代入或反差，提升停留。",
+      targetAudience,
+      sceneHint,
       videoExpression,
       priority: index + 1,
     }));
 
   if (matched.length > 0) return matched;
   return category === "饰品"
-    ? [{ pain: "日常穿搭不够出彩", emotion: "想快速变精致，但不想花太多时间。", videoExpression: "展示搭配前后变化。", priority: 1 }]
+    ? [
+        {
+          hookType: "引起向往",
+          summary: "先让用户看到基础穿搭到精致搭配的变化，立刻产生‘我也想这样’的投射。",
+          stayReason: "靠视觉变化和身份代入提升停留。",
+          targetAudience: audienceHint,
+          sceneHint,
+          videoExpression: "展示搭配前后变化。",
+          priority: 1,
+        },
+      ]
     : [];
 }
 
@@ -653,8 +913,8 @@ function inferVisualPace(notes) {
   return "待视频模型解析后确认；当前建议 TikTok 短镜头节奏。";
 }
 
-function inferSellingExpression(sellingPoints, painPoints) {
-  return `围绕“${sellingPoints[0]?.title || "核心卖点"}”解决“${painPoints[0]?.pain || "用户痛点"}”，表达要短句化。`;
+function inferSellingExpression(sellingPoints, openingHooks) {
+  return `围绕“${sellingPoints[0]?.title || "核心卖点"}”，结合“${openingHooks[0]?.hookType || "高停留开头"}”做短句化表达。`;
 }
 
 function inferSubtitleStyle(notes) {
@@ -674,33 +934,48 @@ function inferBorrowableStructure(notes) {
   return "痛点 → 产品展示 → 使用场景 → 结果变化 → CTA。";
 }
 
-function generatePlanStrategies(input, audiences, painPoints, useCases) {
+function generatePlanStrategies(input, audiences, openingHooks, useCases) {
   const styles = input.selectedStyles.length > 0 ? input.selectedStyles : styleLibrary;
   return Array.from({ length: input.planCount }, (_, index) => {
     const style = styles[index % styles.length];
     const audience = audiences[index % audiences.length];
-    const painPoint = painPoints[index % painPoints.length];
+    const openingHook = openingHooks[index % openingHooks.length];
     const scene = useCases[index % useCases.length];
     return {
       planNo: index + 1,
       style,
       audience: audience.name,
-      painPoint: painPoint.pain,
-      scene: scene.scene,
-      angle: getStyleAngle(style, painPoint.pain, scene.scene),
+      hookType: openingHook.hookType,
+      openingSummary: openingHook.summary,
+      openingDetail: openingHook.videoExpression,
+      openingLine: buildOpeningLine(openingHook, audience.name),
+      sceneHint: scene.scene,
+      angle: getStyleAngle(style, openingHook, scene.scene, audience.name),
     };
   });
 }
 
-function getStyleAngle(style, painPoint, scene) {
+function buildOpeningLine(openingHook, audienceName) {
+  const target = audienceName || openingHook.targetAudience || "目标人群";
+  const type = openingHook.hookType || "开头切入";
+  if (type === "引起好奇") return `Kalau ${target} nampak benda macam ni, mesti terus nak tengok habis.`;
+  if (type === "引起恐惧/避坑") return `Kalau ${target} selalu buat benda ni, memang senang terus踩坑.`;
+  if (type === "引起向往") return `Kalau ${target} nak rasa hidup terus lebih精致, tengok ni.`;
+  if (type === "引起满足") return `Kalau ${target} suka tengok perubahan yang sangat爽, tengok ni.`;
+  return `Kalau ${target} terus rasa “ini memang cakap pasal aku”, tengok ni.`;
+}
+
+function getStyleAngle(style, openingHook, scene, audienceName) {
+  const hookType = openingHook?.hookType || "开头切入";
+  const openingSummary = openingHook?.summary || "先命中目标人群";
   const angleMap = {
-    "UGC 真实测评": `像真实用户一样先吐槽“${painPoint}”，再展示产品在${scene}里的改善。`,
-    开箱种草: `从开箱第一眼和细节质感切入，再自然带到${scene}。`,
-    痛点解决: `前 3 秒放大“${painPoint}”，中段用产品给出直接解决。`,
-    前后对比: `用 before/after 对比展示${scene}中的变化。`,
+    "UGC 真实测评": `像真实用户一样先用“${hookType}”命中${audienceName}，再展示产品在${scene}里的改善。`,
+    开箱种草: `从${hookType}切入，先留住人，再自然带到${scene}里的产品细节。`,
+    痛点解决: `前 3 秒先把“${openingSummary}”拍出来，中段用产品给出直接解决。`,
+    前后对比: `用 before/after 对比把“${openingSummary}”可视化，再展示${scene}中的变化。`,
     场景演示: `完整演示${scene}中的使用步骤，强调真实生活感。`,
-    达人口播: `用达人推荐口吻讲清楚为什么这个产品适合解决“${painPoint}”。`,
-    情绪共鸣: `先讲用户情绪，再把产品作为轻松变好的小改变。`,
+    达人口播: `用达人推荐口吻讲清楚为什么这个产品适合${audienceName}，开头先用${hookType}留人。`,
+    情绪共鸣: `先让${audienceName}觉得“这就是我”，再把产品作为轻松变好的小改变。`,
     剧情反转: `前半段制造小麻烦，后半段用产品完成反转。`,
     礼物推荐: `把产品包装成送礼选择，强调实用、好看、不容易踩雷。`,
     低价冲动购买: `突出低决策成本和即时可得的改善，CTA 更直接。`,
@@ -711,55 +986,73 @@ function getStyleAngle(style, painPoint, scene) {
     家庭日常场景: `放进家庭日常，让使用结果自然出现。`,
     节日促销场景: `结合节日/活动氛围，强调礼物和限时优惠。`,
   };
-  return angleMap[style] || `围绕${scene}和“${painPoint}”生成短视频方案。`;
+  return angleMap[style] || `围绕${hookType}、${scene}和${audienceName}生成短视频方案。`;
 }
 
-function expandPainPoints(basePainPoints, category) {
+function expandOpeningHooks(baseOpeningHooks, category) {
   const extras = {
     家居: [
       {
-        pain: "看过很多收纳方法但坚持不下来",
-        emotion: "想要简单一点，不想每天花太多时间整理。",
+        hookType: "引起满足",
+        summary: "开头先给用户看一秒归位、瞬间变整齐的爽感，天然容易停留。",
+        stayReason: "整理前后强变化，本身就有停留力。",
+        targetAudience: "想轻松整理空间的人",
+        sceneHint: "收纳整理流程",
         videoExpression: "展示一秒归位或随手整理，降低使用门槛。",
         priority: 3,
       },
       {
-        pain: "家里看起来不够整洁，拍照不好看",
-        emotion: "希望花小钱让空间马上变舒服。",
+        hookType: "引起向往",
+        summary: "先给出整洁舒服、拍照更好看的理想生活画面，再让用户想知道怎么做到。",
+        stayReason: "理想生活感容易引发投射和收藏。",
+        targetAudience: "想让家里更整洁好看的人",
+        sceneHint: "卧室或客厅",
         videoExpression: "从手机镜头里的杂乱空间切到整洁画面。",
         priority: 4,
       },
     ],
     饰品: [
       {
-        pain: "每天搭配都像少了一个亮点",
-        emotion: "想快速变精致，但不想花太多时间。",
+        hookType: "引起向往",
+        summary: "让用户先看到同一套穿搭加上产品前后的精致变化，立刻产生向往。",
+        stayReason: "身份投射和前后变化同时成立。",
+        targetAudience: "年轻女性",
+        sceneHint: "通勤或约会前",
         videoExpression: "展示基础穿搭加上饰品后的变化。",
         priority: 2,
       },
       {
-        pain: "想送礼但怕对方用不上",
-        emotion: "希望礼物好看、实用、价格不尴尬。",
+        hookType: "引起向往",
+        summary: "把开头做成收到礼物时的惊喜感，让用户快速代入送礼和收礼场景。",
+        stayReason: "礼物场景自带情绪价值。",
+        targetAudience: "送礼人群",
+        sceneHint: "生日或节日送礼",
         videoExpression: "用礼物开箱和上手细节降低送礼风险。",
         priority: 3,
       },
     ],
     箱包: [
       {
-        pain: "出门小物太多，包里总是乱",
-        emotion: "找东西很烦，通勤和旅行都不方便。",
+        hookType: "引起共鸣",
+        summary: "先拍包里又乱又难找的瞬间，一秒打中通勤和出行人群。",
+        stayReason: "高频困扰强代入。",
+        targetAudience: "通勤和旅行用户",
+        sceneHint: "装包和取物过程",
         videoExpression: "展示包内分区和快速取物。",
         priority: 2,
       },
       {
-        pain: "一个包很难同时适合通勤和周末",
-        emotion: "不想买太多包，希望一包多用。",
+        hookType: "引起好奇",
+        summary: "直接告诉用户一个包怎么切三种出门场景，形成反差和好奇。",
+        stayReason: "一包多用有明显反直觉感。",
+        targetAudience: "不想买太多包的人",
+        sceneHint: "通勤、逛街、旅行",
         videoExpression: "切换通勤、逛街、旅行三个场景。",
         priority: 3,
       },
     ],
   };
-  return [...basePainPoints, ...(extras[category] || [])];
+  return [...baseOpeningHooks, ...(extras[category] || [])];
 }
 
 function expandAudiences(baseAudiences, category, defaultAudiences) {
@@ -858,16 +1151,22 @@ function getDefaults(category, country) {
           isPrimary: false,
         },
       ],
-      painPoints: [
+      openingHooks: [
         {
-          pain: "东西分散、桌面容易乱",
-          emotion: "看起来拥挤，找东西浪费时间。",
+          hookType: "引起共鸣",
+          summary: "先拍桌面乱、东西找不到的瞬间，让租房和小户型人群立刻觉得这是在说自己。",
+          stayReason: "高频困扰强代入，最容易在前 2 秒留人。",
+          targetAudience: "租房和小户型人群",
+          sceneHint: "卧室或客厅整理前",
           videoExpression: "先拍凌乱桌面，再切到产品整理后的画面。",
           priority: 1,
         },
         {
-          pain: "空间小但物品多",
-          emotion: "想买收纳工具，但又担心占地方。",
+          hookType: "引起满足",
+          summary: "直接给用户看整理后一秒变清爽的爽感，天然适合短视频停留。",
+          stayReason: "前后反差明显，用户愿意继续看完变化过程。",
+          targetAudience: "想让空间马上变整洁的人",
+          sceneHint: "小空间整理过程",
           videoExpression: "用俯拍展示产品占用空间和收纳容量。",
           priority: 2,
         },
@@ -903,10 +1202,13 @@ function getDefaults(category, country) {
           isPrimary: true,
         },
       ],
-      painPoints: [
+      openingHooks: [
         {
-          pain: "饰品容易打结或找不到",
-          emotion: "出门前着急，影响搭配心情。",
+          hookType: "引起共鸣",
+          summary: "开头直接拍项链打结、耳环找不到的瞬间，让出门前总是手忙脚乱的人立刻被打中。",
+          stayReason: "精准命中高频困扰和目标人群。",
+          targetAudience: "18-30 岁年轻女性",
+          sceneHint: "卧室梳妆台",
           videoExpression: "展示项链缠绕或耳环散落，再切到整齐收纳。",
           priority: 1,
         },
@@ -942,10 +1244,13 @@ function getDefaults(category, country) {
           isPrimary: true,
         },
       ],
-      painPoints: [
+      openingHooks: [
         {
-          pain: "包看起来小但东西装不下",
-          emotion: "出门前反复取舍，很麻烦。",
+          hookType: "引起好奇",
+          summary: "先用‘这么小的包到底能装多少’制造反差，让通勤和旅行用户愿意继续看。",
+          stayReason: "反差感和容量验证很适合留人。",
+          targetAudience: "通勤和旅行用户",
+          sceneHint: "真实装包过程",
           videoExpression: "用装包挑战展示容量和分区。",
           priority: 1,
         },
@@ -999,16 +1304,14 @@ function renderReview() {
     ["motivation", "购买动机", "textarea"],
     ["contentAngle", "内容切入点", "textarea"],
   ]);
-  renderEditableCards("painPointCards", "painPoints", [
-    ["pain", "痛点", "input"],
-    ["emotion", "用户情绪", "textarea"],
+  renderEditableCards("openingHookCards", "openingHooks", [
+    ["hookType", "开头切入类型", "input"],
+    ["summary", "切入说明", "textarea"],
+    ["stayReason", "停留逻辑", "textarea"],
+    ["targetAudience", "命中人群", "input"],
+    ["sceneHint", "场景提示", "input"],
     ["videoExpression", "视频表达", "textarea", "wide"],
     ["priority", "优先级", "select"],
-  ]);
-  renderEditableCards("useCaseCards", "useCases", [
-    ["scene", "场景", "input"],
-    ["shotSuggestion", "适合镜头", "textarea"],
-    ["localizationNote", "本土化建议", "textarea"],
   ]);
   renderCompetitorAnalysis();
 }
@@ -1033,8 +1336,8 @@ function renderPlanStrategies() {
       <div class="strategy-fields">
         ${renderStrategyField("style", "风格", item.style)}
         ${renderStrategyField("audience", "目标人群", item.audience)}
-        ${renderStrategyField("painPoint", "痛点", item.painPoint)}
-        ${renderStrategyField("scene", "场景", item.scene)}
+        ${renderStrategyField("hookType", "开头切入", item.hookType)}
+        ${renderStrategyField("openingSummary", "切入说明", item.openingSummary, true)}
         ${renderStrategyField("angle", "切入角度", item.angle, true)}
       </div>
     `;
@@ -1068,7 +1371,7 @@ function renderSummary() {
   $("#inputSummary").innerHTML = [
     ["产品", input.productName],
     ["国家/语言", `${input.targetCountry} / ${input.outputLanguage}`],
-    ["核心卖点", input.rawCoreSellingPoints || "未填写"],
+    ["视频必呈现点", input.rawCoreSellingPoints || "未填写"],
     ["卖点/促销", input.rawSellingPoints || "未填写"],
     ["参考文案", input.referenceCopies?.length ? `${input.referenceCopies.length} 条` : "未填写"],
     ["方案数量", `${state.aiAnalysis?.planStrategies?.length || input.planCount} 条`],
@@ -1154,6 +1457,7 @@ function renderScriptResults() {
   container.innerHTML = "";
 
   state.videoScripts.forEach((script) => {
+    script.selected = script.selected ?? true;
     const card = document.createElement("article");
     card.className = "script-card";
     card.innerHTML = `
@@ -1162,7 +1466,33 @@ function renderScriptResults() {
           <strong>方案 ${script.planNo}｜${escapeHtml(script.style || "")}</strong>
           <span>${escapeHtml(script.model || "")} · 约 ${escapeHtml(script.totalDuration || "")} 秒 · ${script.segments?.length || 0} 段</span>
         </div>
-        <button class="small-button" type="button" data-copy-script>复制整条脚本</button>
+        <div class="script-actions">
+          <label class="primary-check compact-check">
+            <input type="checkbox" data-script-field="selected" ${script.selected ? "checked" : ""}>
+            导出
+          </label>
+          <button class="small-button" type="button" data-copy-script>复制整条脚本</button>
+        </div>
+      </div>
+      <div class="script-meta">
+        <div>
+          <label>当地视频标题</label>
+          <strong>${escapeHtml(script.videoTitle || "标题待生成")}</strong>
+        </div>
+        <div>
+          <label>Tag 推荐</label>
+          <span>${(script.tags || []).map((tag) => `<em>${escapeHtml(tag)}</em>`).join("") || "<em>暂无</em>"}</span>
+        </div>
+      </div>
+      <div class="script-copy-block">
+        <div class="mini-field">
+          <label>目标语言文案</label>
+          <textarea readonly>${escapeHtml(script.voiceover || "")}</textarea>
+        </div>
+        <div class="mini-field">
+          <label>中文文案（用户微调稿）</label>
+          <textarea readonly>${escapeHtml(script.editedZh || "")}</textarea>
+        </div>
       </div>
       <div class="script-body">
         ${(script.segments || [])
@@ -1171,38 +1501,39 @@ function renderScriptResults() {
               <section class="segment-block">
                 <div class="segment-head">
                   <strong>第 ${segment.segmentNo} 段 · ${segment.duration}s</strong>
-                  <span>${escapeHtml(segment.referenceMode || "")}</span>
+                  <span>${escapeHtml(`参考图 ${segment.referenceCount || 1} 张`)}</span>
                 </div>
-                ${(segment.shots || [])
-                  .map(
-                    (shot) => `
-                      <div class="shot-block">
-                        <div class="shot-title">镜头 ${shot.shotNo} · ${shot.duration}s</div>
-                        <div class="prompt-grid">
-                          <div class="mini-field">
-                            <label>参考图 prompt</label>
-                            <textarea readonly>${escapeHtml(shot.referenceImagePrompt)}</textarea>
-                          </div>
-                          <div class="mini-field">
-                            <label>视频生成 prompt</label>
-                            <textarea readonly>${escapeHtml(shot.videoPrompt)}</textarea>
-                          </div>
-                        </div>
-                      </div>
-                    `
-                  )
-                  .join("")}
+                <div class="segment-copy">
+                  <div><strong>目标语言段文案：</strong>${escapeHtml(segment.segmentVoiceover || "")}</div>
+                  <div><strong>中文段文案：</strong>${escapeHtml(segment.segmentEditedZh || "")}</div>
+                </div>
+                <div class="prompt-grid">
+                  <div class="mini-field">
+                    <label>参考图 prompt</label>
+                    <textarea readonly>${escapeHtml(segment.referencePrompt || "")}</textarea>
+                  </div>
+                  <div class="mini-field">
+                    <label>视频生成 prompt</label>
+                    <textarea readonly>${escapeHtml(segment.videoPrompt || "")}</textarea>
+                  </div>
+                </div>
               </section>
             `
           )
           .join("")}
       </div>
     `;
+    card.querySelectorAll("[data-script-field]").forEach((field) => {
+      field.addEventListener("change", () => {
+        syncVideoScriptsFromDom();
+      });
+    });
     card.querySelector("[data-copy-script]").addEventListener("click", () => {
       copyText(toScriptText(script));
     });
     container.appendChild(card);
   });
+  syncVideoScriptsFromDom();
 }
 
 function toScriptText(script) {
@@ -1210,17 +1541,22 @@ function toScriptText(script) {
     `方案 ${script.planNo}｜${script.style || ""}`,
     `模型：${script.model}`,
     `总时长：${script.totalDuration}s`,
+    `当地视频标题：${script.videoTitle || ""}`,
+    `Tag 推荐：${(script.tags || []).join(" ")}`,
+    `目标语言文案：${script.voiceover || ""}`,
+    `中文文案：${script.editedZh || ""}`,
     "",
     ...(script.segments || []).flatMap((segment) => [
-      `第 ${segment.segmentNo} 段｜${segment.duration}s｜${segment.referenceMode || ""}`,
-      ...(segment.shots || []).flatMap((shot) => [
-        `镜头 ${shot.shotNo}｜${shot.duration}s`,
-        "参考图 prompt:",
-        shot.referenceImagePrompt,
-        "视频生成 prompt:",
-        shot.videoPrompt,
-        "",
-      ]),
+      `第 ${segment.segmentNo} 段｜${segment.duration}s｜参考图 ${segment.referenceCount || 1} 张`,
+      "目标语言段文案：",
+      segment.segmentVoiceover || "",
+      "中文段文案：",
+      segment.segmentEditedZh || "",
+      "参考图 prompt:",
+      segment.referencePrompt || "",
+      "视频生成 prompt:",
+      segment.videoPrompt || "",
+      "",
     ]),
   ].join("\n");
 }
@@ -1267,6 +1603,112 @@ function syncCopyDraftsFromDom() {
   });
 }
 
+function syncVideoScriptsFromDom() {
+  const cards = $$(".script-card");
+  if (!cards.length || !state.videoScripts.length) return;
+  state.videoScripts = cards.map((card, index) => {
+    const script = { ...state.videoScripts[index] };
+    card.querySelectorAll("[data-script-field]").forEach((field) => {
+      if (field.type === "checkbox") {
+        script[field.dataset.scriptField] = field.checked;
+      } else {
+        script[field.dataset.scriptField] = field.value.trim();
+      }
+    });
+    return script;
+  });
+}
+
+async function exportSelectedScriptsToFeishu() {
+  syncVideoScriptsFromDom();
+  const selectedScripts = state.videoScripts.filter((script) => script.selected);
+  if (!selectedScripts.length) {
+    alert("请至少勾选 1 条要导出的脚本。");
+    return;
+  }
+  const config = getStoredFeishuConfig();
+  if (!isFeishuConfigComplete(config)) {
+    openFeishuConfigDialog({ exportAfterSave: true });
+    return;
+  }
+  const button = $("#exportToFeishu");
+  setButtonLoading(button, true, "正在导出飞书...", "导出到飞书");
+  try {
+    const result = await requestFeishuExport({
+      feishu: config,
+      productInput: state.productInput,
+      aiAnalysis: state.aiAnalysis,
+      videoScripts: state.videoScripts,
+      selectedIndexes: state.videoScripts
+        .map((script, index) => (script.selected ? index : -1))
+        .filter((index) => index >= 0),
+    });
+
+    if (result.needConfirmUpdate) {
+      const ok = window.confirm(result.message || "产品信息表已存在，是否更新？");
+      if (!ok) return;
+      const confirmed = await requestFeishuExport({
+        feishu: config,
+        productInput: state.productInput,
+        aiAnalysis: state.aiAnalysis,
+        videoScripts: state.videoScripts,
+        selectedIndexes: state.videoScripts
+          .map((script, index) => (script.selected ? index : -1))
+          .filter((index) => index >= 0),
+        confirmProductUpdate: true,
+      });
+      alert(`导出完成：产品表 ${confirmed.updatedProduct ? "已更新" : "已新增"}，脚本表新增 ${confirmed.createdCount || 0} 条。`);
+      return;
+    }
+
+    alert(`导出完成：产品表 ${result.updatedProduct ? "已更新" : "已新增"}，脚本表新增 ${result.createdCount || 0} 条。`);
+  } catch (error) {
+    console.error(error);
+    alert(error.message || "导出飞书失败。");
+  } finally {
+    setButtonLoading(button, false, "正在导出飞书...", "导出到飞书");
+  }
+}
+
+async function requestFeishuExport(payload) {
+  const response = await fetch("/api/feishu/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "导出飞书失败");
+  }
+  return data;
+}
+
+async function requestFeishuDiagnose(payload) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  let response;
+  try {
+    response = await fetch("/api/feishu/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("飞书连接测试超时（15 秒）。这通常表示飞书接口响应很慢，或服务端请求卡住了。");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "飞书连接测试失败");
+  }
+  return data;
+}
+
 function renderEditableCards(containerId, type, fields) {
   const container = $(`#${containerId}`);
   container.innerHTML = "";
@@ -1287,7 +1729,7 @@ function renderEditableCards(containerId, type, fields) {
         <h3>${escapeHtml(label)}</h3>
         <div class="card-tools">
           ${primaryToggle}
-          ${type === "painPoints" ? `<span class="tag">P${item.priority || index + 1}</span>` : ""}
+          ${type === "openingHooks" ? `<span class="tag">P${item.priority || index + 1}</span>` : ""}
           <button class="icon-button" type="button" title="删除" data-delete="${type}" data-index="${index}">×</button>
         </div>
       </div>
@@ -1306,6 +1748,50 @@ function renderEditableCards(containerId, type, fields) {
       renderReview();
     });
   });
+}
+
+function openFeishuConfigDialog({ exportAfterSave = false } = {}) {
+  const dialog = $("#feishuConfigDialog");
+  if (!dialog) return;
+  state.pendingFeishuExport = exportAfterSave;
+  fillFeishuConfigForm(getStoredFeishuConfig());
+  $("#saveFeishuConfig").textContent = exportAfterSave ? "保存并导出" : "保存配置";
+  dialog.showModal();
+}
+
+function getStoredFeishuConfig() {
+  try {
+    const raw = window.localStorage.getItem(FEISHU_CONFIG_STORAGE_KEY);
+    if (!raw) return { bitableUrl: "" };
+    const parsed = JSON.parse(raw);
+    return {
+      bitableUrl: String(parsed.bitableUrl || "").trim(),
+    };
+  } catch {
+    return { bitableUrl: "" };
+  }
+}
+
+function saveFeishuConfig(config) {
+  window.localStorage.setItem(FEISHU_CONFIG_STORAGE_KEY, JSON.stringify(config));
+}
+
+function isFeishuConfigComplete(config) {
+  return Boolean(config?.bitableUrl);
+}
+
+function fillFeishuConfigForm(config) {
+  $("#feishuBitableUrl").value = config.bitableUrl || "";
+}
+
+function collectFeishuConfigFromForm() {
+  const config = {
+    bitableUrl: $("#feishuBitableUrl").value.trim(),
+  };
+  if (!config.bitableUrl) {
+    throw new Error("请填写飞书多维表链接。");
+  }
+  return config;
 }
 
 function renderField(key, label, fieldType, width, value = "") {
@@ -1370,7 +1856,7 @@ function syncAnalysisFromDom() {
     return item;
   });
 
-  ["sellingPoints", "audiences", "painPoints", "useCases"].forEach((type) => {
+  ["sellingPoints", "audiences", "openingHooks"].forEach((type) => {
     state.aiAnalysis[type] = $$(`[data-type="${type}"]`).map((card) => {
       const item = {};
       card.querySelectorAll("[data-field]").forEach((field) => {
@@ -1402,16 +1888,14 @@ function createEmptyItem(type) {
       contentAngle: "",
       isPrimary: false,
     },
-    painPoints: {
-      pain: "新痛点",
-      emotion: "",
+    openingHooks: {
+      hookType: "引起共鸣",
+      summary: "新的开头切入说明",
+      stayReason: "",
+      targetAudience: "",
+      sceneHint: "",
       videoExpression: "",
       priority: 3,
-    },
-    useCases: {
-      scene: "新场景",
-      shotSuggestion: "",
-      localizationNote: "",
     },
   };
   return templates[type];
@@ -1421,8 +1905,7 @@ function getCardLabel(type, item, index) {
   if (type === "audiences") return `人群素材 ${index + 1}`;
   const keys = {
     sellingPoints: "title",
-    painPoints: "pain",
-    useCases: "scene",
+    openingHooks: "hookType",
   };
   return item[keys[type]] || `条目 ${index + 1}`;
 }
