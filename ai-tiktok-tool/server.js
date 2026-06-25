@@ -471,6 +471,7 @@ function createMockAnalysis(input) {
     hookType: openingHooks[index % openingHooks.length].hookType,
     openingSummary: openingHooks[index % openingHooks.length].summary,
     openingDetail: openingHooks[index % openingHooks.length].videoExpression,
+    stayReason: openingHooks[index % openingHooks.length].stayReason,
     sceneHint: useCases[index % useCases.length]?.scene || "日常场景",
     angle: "开头优先增加停留并打中目标人群，中间叠加卖点，结尾促销下单。",
   }));
@@ -761,7 +762,7 @@ async function callOpenAI({ system, user, schemaName, schema }) {
   const text = data.output_text || collectOutputText(data);
   if (!text) throw new Error("OpenAI API 没有返回可解析内容");
   try {
-    return JSON.parse(text);
+    return parseModelJson(text);
   } catch (error) {
     throw new Error(
       [
@@ -803,7 +804,7 @@ async function callGemini({ system, user, schemaName, schema }) {
   const data = await requestGeminiWithRetry(models, payload);
   const text = collectGeminiText(data);
   if (!text) throw new Error("Gemini API 没有返回可解析内容");
-  return JSON.parse(stripJsonCodeFence(text));
+  return parseModelJson(stripJsonCodeFence(text));
 }
 
 async function requestGeminiWithRetry(models, payload) {
@@ -1323,6 +1324,10 @@ function normalizeSegmentVideoPrompt(text = "", keepReferenceField = false) {
 }
 
 function buildSyncCopyPrompt(input) {
+  const productInput = input.productInput || {};
+  const draft = input.draft || {};
+  const mustShowPoints = splitLocal(productInput.rawCoreSellingPoints).slice(0, 4);
+  const sellingPoints = splitLocal(productInput.rawSellingPoints).slice(0, 6);
   return JSON.stringify(
     {
       task: "把用户修改后的中文微调稿，同步改写成目标语言口播。",
@@ -1336,11 +1341,16 @@ function buildSyncCopyPrompt(input) {
         "开头抓目标人群注意，中间卖点叠加，结尾呼吁下单。",
         "避免当地文化、宗教禁忌；避免夸张承诺除菌、治病、永久除味。",
       ],
-      productInput: input.productInput,
-      draft: input.draft,
-      chineseEditedCopy: input.draft?.editedZh || "",
-      targetLanguage: input.productInput?.outputLanguage || "",
-      targetCountry: input.productInput?.targetCountry || "",
+      context: {
+        productName: productInput.productName || "",
+        targetLanguage: productInput.outputLanguage || "",
+        targetCountry: productInput.targetCountry || "",
+        audience: draft.audience || "",
+        style: draft.style || "",
+        mustShowPoints,
+        supportingSellingPoints: sellingPoints,
+      },
+      chineseEditedCopy: draft.editedZh || "",
     },
     null,
     2
@@ -1348,6 +1358,21 @@ function buildSyncCopyPrompt(input) {
 }
 
 function buildScriptPrompt(input) {
+  const productInput = input.productInput || {};
+  const draft = Array.isArray(input.copyDrafts) ? input.copyDrafts[0] || {} : input.copyDrafts || {};
+  const planNo = Number(draft.planNo) || 1;
+  const plan =
+    (input.aiAnalysis?.planStrategies || []).find((item) => Number(item.planNo) === planNo) ||
+    input.aiAnalysis?.planStrategies?.[0] ||
+    {};
+  const requiredCoreSellingPoints = uniqueItems([
+    ...splitLocal(productInput.rawCoreSellingPoints).slice(0, 4),
+    ...((input.aiAnalysis?.sellingPoints || []).filter((item) => item.isPrimary).flatMap((item) => [item.title, item.description]).slice(0, 4)),
+  ]).slice(0, 6);
+  const supplementalSellingPoints = uniqueItems([
+    ...splitLocal(productInput.rawSellingPoints).slice(0, 6),
+    ...((input.aiAnalysis?.sellingPoints || []).flatMap((item) => [item.title, item.description]).slice(0, 8)),
+  ]).slice(0, 8);
   return JSON.stringify(
     {
       task: "根据最终保留的口播文案，生成给 Sora/Veo 使用的 AI 视频脚本提示词。",
@@ -1401,9 +1426,23 @@ function buildScriptPrompt(input) {
         "每条脚本必须生成 tags：3-5 个当地 TikTok 可用 tag，可包含 #TikTokShop、产品类目、使用场景、风格或购买动机。",
         "tags 要服务于搜索和转化，不要堆无关热门词。",
       ],
-      productInput: input.productInput,
-      aiAnalysis: input.aiAnalysis,
-      copyDrafts: input.copyDrafts,
+      currentScriptOnly: {
+        planNo,
+        videoModel: input.videoModel,
+        productName: productInput.productName || "",
+        targetCountry: productInput.targetCountry || "",
+        outputLanguage: productInput.outputLanguage || "",
+        style: draft.style || plan.style || "",
+        audience: draft.audience || plan.audience || "",
+        hookType: plan.hookType || "",
+        openingSummary: plan.openingSummary || "",
+        openingDetail: plan.openingDetail || "",
+        sceneHint: plan.sceneHint || "",
+        requiredCoreSellingPoints,
+        supplementalSellingPoints,
+        voiceover: draft.voiceover || "",
+        editedZh: draft.editedZh || "",
+      },
     },
     null,
     2
@@ -1658,7 +1697,7 @@ function analysisSchema(planCount = 5) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["planNo", "style", "audience", "hookType", "openingSummary", "openingDetail", "sceneHint", "angle"],
+          required: ["planNo", "style", "audience", "hookType", "openingSummary", "openingDetail", "stayReason", "sceneHint", "angle"],
           properties: {
             planNo: { type: "number" },
             style: stringField,
@@ -1666,6 +1705,7 @@ function analysisSchema(planCount = 5) {
             hookType: stringField,
             openingSummary: stringField,
             openingDetail: stringField,
+            stayReason: stringField,
             sceneHint: stringField,
             angle: stringField,
           },
@@ -1730,6 +1770,58 @@ function stripJsonCodeFence(text) {
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
+}
+
+function parseModelJson(text) {
+  const cleaned = stripJsonCodeFence(text);
+  try {
+    return JSON.parse(cleaned);
+  } catch (error) {
+    const extracted = extractFirstJsonObject(cleaned);
+    if (extracted) {
+      return JSON.parse(extracted);
+    }
+    throw error;
+  }
+}
+
+function extractFirstJsonObject(text) {
+  const source = String(text || "").trim();
+  const start = source.search(/[\[{]/);
+  if (start === -1) return "";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{" || char === "[") {
+      depth += 1;
+    } else if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+
+  return "";
 }
 
 function isAuthEnabled() {

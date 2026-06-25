@@ -6,6 +6,7 @@ const state = {
   videoScripts: [],
   selectedVideoModel: "sora",
   pendingFeishuExport: false,
+  scriptCache: {},
 };
 
 const FEISHU_CONFIG_STORAGE_KEY = "ai_tiktok_tool_feishu_config";
@@ -333,12 +334,25 @@ async function runScriptGeneration() {
   const button = $("#generateScripts");
   setButtonLoading(button, true, "AI 正在生成脚本...", "生成脚本提示词");
   try {
-    state.videoScripts = await requestVideoScripts({
-      productInput: state.productInput,
-      aiAnalysis: state.aiAnalysis,
-      copyDrafts: state.selectedCopyDrafts,
-      videoModel: state.selectedVideoModel,
-    });
+    const scripts = [];
+    for (const draft of state.selectedCopyDrafts) {
+      button.textContent = `AI 正在生成脚本 ${draft.planNo}/${state.selectedCopyDrafts.length}...`;
+      const cacheKey = buildScriptCacheKey(draft, state.selectedVideoModel);
+      let currentScripts = state.scriptCache[cacheKey];
+      if (!currentScripts) {
+        currentScripts = await requestVideoScriptsWithRetry({
+          productInput: state.productInput,
+          aiAnalysis: state.aiAnalysis,
+          copyDrafts: [draft],
+          videoModel: state.selectedVideoModel,
+        });
+        state.scriptCache[cacheKey] = currentScripts;
+      }
+      if (Array.isArray(currentScripts) && currentScripts.length) {
+        scripts.push(...currentScripts);
+      }
+    }
+    state.videoScripts = scripts;
     renderScriptResults();
   } catch (error) {
     console.error(error);
@@ -361,6 +375,58 @@ async function requestVideoScripts(payload) {
   return Array.isArray(data.scripts) && data.scripts.length ? data.scripts : generateMockVideoScripts(payload);
 }
 
+async function requestVideoScriptsWithRetry(payload, maxRetries = 2) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+    try {
+      return await requestVideoScripts(payload);
+    } catch (error) {
+      lastError = error;
+      if (attempt > maxRetries || !isRetryableScriptError(error)) break;
+      await wait(1200 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableScriptError(error) {
+  const message = String(error?.message || "");
+  return /524|超时|timeout|网关|非 JSON 响应/i.test(message);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function buildScriptCacheKey(draft, videoModel) {
+  return JSON.stringify({
+    videoModel,
+    planNo: draft?.planNo,
+    style: draft?.style,
+    audience: draft?.audience,
+    voiceover: draft?.voiceover,
+    editedZh: draft?.editedZh,
+  });
+}
+
+function buildSyncCopyPayload(draft) {
+  return {
+    productInput: {
+      productName: state.productInput.productName,
+      targetCountry: state.productInput.targetCountry,
+      outputLanguage: state.productInput.outputLanguage,
+      rawCoreSellingPoints: state.productInput.rawCoreSellingPoints,
+      rawSellingPoints: state.productInput.rawSellingPoints,
+    },
+    draft: {
+      planNo: draft.planNo,
+      style: draft.style,
+      audience: draft.audience,
+      editedZh: draft.editedZh,
+    },
+  };
+}
+
 async function syncEditedCopyToVoiceover(index, button) {
   syncCopyDraftsFromDom();
   const draft = state.copyDrafts[index];
@@ -374,10 +440,7 @@ async function syncEditedCopyToVoiceover(index, button) {
     const response = await fetch("/api/sync-copy", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        productInput: state.productInput,
-        draft,
-      }),
+      body: JSON.stringify(buildSyncCopyPayload(draft)),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -426,10 +489,7 @@ async function syncSelectedEditedCopiesToVoiceover() {
       const response = await fetch("/api/sync-copy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          productInput: state.productInput,
-          draft,
-        }),
+        body: JSON.stringify(buildSyncCopyPayload(draft)),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -948,6 +1008,7 @@ function generatePlanStrategies(input, audiences, openingHooks, useCases) {
       hookType: openingHook.hookType,
       openingSummary: openingHook.summary,
       openingDetail: openingHook.videoExpression,
+      stayReason: openingHook.stayReason,
       openingLine: buildOpeningLine(openingHook, audience.name),
       sceneHint: scene.scene,
       angle: getStyleAngle(style, openingHook, scene.scene, audience.name),
@@ -1300,19 +1361,6 @@ function renderReview() {
     ["title", "卖点标题", "input"],
     ["description", "卖点说明", "textarea", "wide"],
   ]);
-  renderEditableCards("audienceCards", "audiences", [
-    ["motivation", "购买动机", "textarea"],
-    ["contentAngle", "内容切入点", "textarea"],
-  ]);
-  renderEditableCards("openingHookCards", "openingHooks", [
-    ["hookType", "开头切入类型", "input"],
-    ["summary", "切入说明", "textarea"],
-    ["stayReason", "停留逻辑", "textarea"],
-    ["targetAudience", "命中人群", "input"],
-    ["sceneHint", "场景提示", "input"],
-    ["videoExpression", "视频表达", "textarea", "wide"],
-    ["priority", "优先级", "select"],
-  ]);
   renderCompetitorAnalysis();
 }
 
@@ -1336,9 +1384,9 @@ function renderPlanStrategies() {
       <div class="strategy-fields">
         ${renderStrategyField("style", "风格", item.style)}
         ${renderStrategyField("audience", "目标人群", item.audience)}
-        ${renderStrategyField("hookType", "开头切入", item.hookType)}
-        ${renderStrategyField("openingSummary", "切入说明", item.openingSummary, true)}
-        ${renderStrategyField("angle", "切入角度", item.angle, true)}
+        ${renderStrategyField("hookType", "开头切入类型", item.hookType)}
+        ${renderStrategyField("openingDetail", "切入画面", item.openingDetail, true)}
+        ${renderStrategyField("stayReason", "开头停留逻辑", item.stayReason, true)}
       </div>
     `;
     container.appendChild(card);
@@ -1856,7 +1904,7 @@ function syncAnalysisFromDom() {
     return item;
   });
 
-  ["sellingPoints", "audiences", "openingHooks"].forEach((type) => {
+  ["sellingPoints"].forEach((type) => {
     state.aiAnalysis[type] = $$(`[data-type="${type}"]`).map((card) => {
       const item = {};
       card.querySelectorAll("[data-field]").forEach((field) => {
@@ -1883,29 +1931,13 @@ function createEmptyItem(type) {
       title: "新卖点",
       isPrimary: false,
     },
-    audiences: {
-      motivation: "",
-      contentAngle: "",
-      isPrimary: false,
-    },
-    openingHooks: {
-      hookType: "引起共鸣",
-      summary: "新的开头切入说明",
-      stayReason: "",
-      targetAudience: "",
-      sceneHint: "",
-      videoExpression: "",
-      priority: 3,
-    },
   };
   return templates[type];
 }
 
 function getCardLabel(type, item, index) {
-  if (type === "audiences") return `人群素材 ${index + 1}`;
   const keys = {
     sellingPoints: "title",
-    openingHooks: "hookType",
   };
   return item[keys[type]] || `条目 ${index + 1}`;
 }
