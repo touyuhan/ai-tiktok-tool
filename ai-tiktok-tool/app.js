@@ -7,6 +7,7 @@ const state = {
   selectedVideoModel: "sora",
   pendingFeishuExport: false,
   scriptCache: {},
+  manualCopyMode: false,
 };
 
 const FEISHU_CONFIG_STORAGE_KEY = "ai_tiktok_tool_feishu_config";
@@ -64,9 +65,17 @@ planCount.addEventListener("input", () => {
   planCountOutput.textContent = `${planCount.value} 条`;
 });
 
+function syncCountryLanguage(countrySelect, languageSelect) {
+  const language = countryLanguageMap[countrySelect?.value];
+  if (language && languageSelect) languageSelect.value = language;
+}
+
 $("#targetCountry").addEventListener("change", (event) => {
-  const language = countryLanguageMap[event.target.value];
-  if (language) $("#outputLanguage").value = language;
+  syncCountryLanguage(event.target, $("#outputLanguage"));
+});
+
+$("#manualTargetCountry")?.addEventListener("change", (event) => {
+  syncCountryLanguage(event.target, $("#manualOutputLanguage"));
 });
 
 $("#logoutButton")?.addEventListener("click", async () => {
@@ -119,6 +128,10 @@ $("#fillDemo").addEventListener("click", () => {
   $$('input[name="styles"]').forEach((input) => {
     input.checked = demoStyles.includes(input.value);
   });
+});
+
+$("#directToManualCopy")?.addEventListener("click", () => {
+  openManualCopyMode();
 });
 
 productForm.addEventListener("submit", (event) => {
@@ -180,6 +193,16 @@ $("#confirmCopy").addEventListener("click", () => {
 
 $("#backToCopy").addEventListener("click", showCopy);
 
+$("#backToFullFlow")?.addEventListener("click", () => {
+  state.manualCopyMode = false;
+  renderCopyView();
+  showInput();
+});
+
+$("#generateManualScripts")?.addEventListener("click", () => {
+  generateScriptsFromManualCopy();
+});
+
 $("#generateScripts").addEventListener("click", () => {
   runScriptGeneration();
 });
@@ -190,6 +213,14 @@ $("#openFeishuConfig")?.addEventListener("click", () => {
 
 $("#exportToFeishu")?.addEventListener("click", () => {
   exportSelectedScriptsToFeishu();
+});
+
+$("#exportExcelTable")?.addEventListener("click", () => {
+  exportSelectedScriptsAsExcelTable();
+});
+
+$("#copyReadableScripts")?.addEventListener("click", () => {
+  copySelectedScriptsAsReadableText();
 });
 
 $("#closeDialog").addEventListener("click", () => {
@@ -276,6 +307,16 @@ function collectProductInput() {
   };
 }
 
+function collectManualCopyInput() {
+  return {
+    productName: $("#manualProductName").value.trim(),
+    targetCountry: $("#manualTargetCountry").value,
+    outputLanguage: $("#manualOutputLanguage").value,
+    sourceCopy: $("#manualSourceCopy").value.trim(),
+    sourceLanguage: $("#manualSourceLanguage").value,
+  };
+}
+
 async function requestAiAnalysis(productInput) {
   const response = await fetch("/api/analyze", {
     method: "POST",
@@ -316,6 +357,64 @@ async function runCopyGeneration() {
   }
 }
 
+async function openManualCopyMode() {
+  state.manualCopyMode = true;
+  const product = state.productInput || collectProductInput();
+  state.productInput = {
+    ...(state.productInput || {}),
+    ...product,
+    planCount: product.planCount || 1,
+  };
+  $("#manualProductName").value = product.productName || "";
+  $("#manualTargetCountry").value = product.targetCountry || "";
+  $("#manualOutputLanguage").value = product.outputLanguage || "";
+  $("#manualSourceLanguage").value = "自动识别";
+  $("#manualSourceCopy").value = state.copyDrafts.find((draft) => draft?.editedZh)?.editedZh || "";
+  renderCopyView();
+  showCopy();
+}
+
+async function generateScriptsFromManualCopy() {
+  const manual = collectManualCopyInput();
+  if (!manual.sourceCopy || !manual.targetCountry || !manual.outputLanguage) {
+    alert("请先填写文案、国家和输出语言。");
+    return;
+  }
+
+  const button = $("#generateManualScripts");
+  setButtonLoading(button, true, "正在处理文案...", "直接生成脚本");
+  try {
+    state.productInput = {
+      ...(state.productInput || {}),
+      productName: manual.productName || state.productInput?.productName || "手动文案",
+      targetCountry: manual.targetCountry,
+      outputLanguage: manual.outputLanguage,
+      planCount: 1,
+    };
+    state.copyDrafts = createManualCopyDrafts(manual, state.productInput);
+    if (manual.sourceCopy) {
+      state.copyDrafts = await requestManualCopyDrafts({
+        productInput: {
+          productName: manual.productName || state.productInput.productName,
+          targetCountry: manual.targetCountry,
+          outputLanguage: manual.outputLanguage,
+          planCount: 1,
+        },
+        aiAnalysis: state.aiAnalysis || { planStrategies: [] },
+        manualCopy: manual,
+      });
+    }
+    state.selectedCopyDrafts = state.copyDrafts.filter((draft) => draft.selected);
+    renderScriptSetup();
+    showScript();
+  } catch (error) {
+    console.error(error);
+    alert(error.message || "手动文案生成脚本失败。");
+  } finally {
+    setButtonLoading(button, false, "正在处理文案...", "下一步：选择模型");
+  }
+}
+
 async function requestCopyDrafts(payload) {
   const response = await fetch("/api/copy", {
     method: "POST",
@@ -325,6 +424,19 @@ async function requestCopyDrafts(payload) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.error || "AI 文案生成失败");
+  }
+  return normalizeCopyDrafts(data.copyDrafts, payload.productInput, payload.aiAnalysis);
+}
+
+async function requestManualCopyDrafts(payload) {
+  const response = await fetch("/api/manual-copy", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "AI 文案处理失败");
   }
   return normalizeCopyDrafts(data.copyDrafts, payload.productInput, payload.aiAnalysis);
 }
@@ -372,7 +484,11 @@ async function requestVideoScripts(payload) {
   if (!response.ok) {
     throw new Error(data.error || "AI 脚本生成失败");
   }
-  return Array.isArray(data.scripts) && data.scripts.length ? data.scripts : generateMockVideoScripts(payload);
+  if (data.warning) {
+    console.warn(data.warning);
+  }
+  const scripts = Array.isArray(data.scripts) && data.scripts.length ? data.scripts : generateMockVideoScripts(payload);
+  return completeVideoScripts(scripts, payload);
 }
 
 async function requestVideoScriptsWithRetry(payload, maxRetries = 2) {
@@ -672,6 +788,31 @@ function generateMockCopyDrafts(productInput, aiAnalysis) {
   });
 }
 
+function createManualCopyDrafts(manualCopy, productInput) {
+  const sourceCopy = String(manualCopy.sourceCopy || "").trim();
+  const language = productInput.outputLanguage || manualCopy.outputLanguage || "目标语言";
+  const country = productInput.targetCountry || manualCopy.targetCountry || "目标国家";
+  const inputLooksChinese = /中文|自动识别/i.test(manualCopy.sourceLanguage || "") ? true : isMostlyChinese(sourceCopy);
+  const voiceover = inputLooksChinese ? `[${language}待同步] ${sourceCopy}` : sourceCopy || "请先输入中文或目标语言文案。";
+  const editedZh = inputLooksChinese
+    ? sourceCopy
+    : `根据${country} / ${language} 的目标受众，将已有文案改写成更自然的本地表达。`;
+  return [
+    {
+      planNo: 1,
+      style: "我已有文案",
+      audience: "已有文案复用",
+      duration: "20-30s",
+      hook: "直接复用已有文案",
+      voiceover,
+      voiceoverZh: editedZh,
+      editedZh,
+      cta: "直接生成脚本",
+      selected: true,
+    },
+  ];
+}
+
 function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
   const modelName = videoModel === "veo" ? "Veo" : "Sora";
   const segmentDuration = videoModel === "veo" ? 10 : 12;
@@ -726,6 +867,33 @@ function generateMockVideoScripts({ productInput, copyDrafts, videoModel }) {
   });
 }
 
+function completeVideoScripts(scripts, payload) {
+  const fallbackScripts = generateMockVideoScripts(payload);
+  return (scripts || []).map((script, scriptIndex) => {
+    const fallback = fallbackScripts[scriptIndex] || fallbackScripts[0] || {};
+    const fallbackSegments = fallback.segments || [];
+    const segments = Array.isArray(script.segments) && script.segments.length ? script.segments : fallbackSegments;
+    return {
+      ...fallback,
+      ...script,
+      voiceover: script.voiceover || fallback.voiceover || payload.copyDrafts?.[scriptIndex]?.voiceover || "",
+      editedZh: script.editedZh || fallback.editedZh || payload.copyDrafts?.[scriptIndex]?.editedZh || "",
+      segments: segments.map((segment, segmentIndex) => {
+        const fallbackSegment = fallbackSegments[segmentIndex] || fallbackSegments[0] || {};
+        return {
+          ...fallbackSegment,
+          ...segment,
+          segmentVoiceover: segment.segmentVoiceover || fallbackSegment.segmentVoiceover || script.voiceover || fallback.voiceover || "",
+          segmentEditedZh: segment.segmentEditedZh || fallbackSegment.segmentEditedZh || script.editedZh || fallback.editedZh || "",
+          referencePrompt: segment.referencePrompt || fallbackSegment.referencePrompt || "",
+          videoPrompt: segment.videoPrompt || fallbackSegment.videoPrompt || "",
+          shots: Array.isArray(segment.shots) && segment.shots.length ? segment.shots : fallbackSegment.shots || [],
+        };
+      }),
+    };
+  });
+}
+
 function generateMockVideoTitle(productInput = {}, draft = {}) {
   const productName = productInput.productName || "produk ni";
   if (productInput.targetCountry === "马来西亚" || productInput.outputLanguage === "马来语") {
@@ -758,6 +926,11 @@ function estimateVoiceoverDurationSeconds(voiceover = "", editedZh = "") {
 }
 
 function splitScriptIntoSegments(voiceover = "", editedZh = "", maxDuration = 12) {
+  const totalDuration = estimateVoiceoverDurationSeconds(voiceover, editedZh);
+  if (totalDuration > 0 && totalDuration <= maxDuration) {
+    return [{ voiceover: voiceover || "", zh: editedZh || "", duration: Math.max(3, totalDuration), units: [{ voiceover, zh: editedZh }] }];
+  }
+
   const voiceParts = splitScriptUnits(voiceover);
   const zhParts = splitScriptUnits(editedZh);
   const count = Math.max(voiceParts.length, zhParts.length, 1);
@@ -1439,6 +1612,14 @@ function renderCopyView() {
   const container = $("#copyCards");
   container.innerHTML = "";
 
+  $("#manualCopyPanel")?.classList.toggle("hidden", !state.manualCopyMode);
+  $("#normalCopyPanel")?.classList.toggle("hidden", state.manualCopyMode);
+  $("#generateManualScripts")?.classList.toggle("hidden", !state.manualCopyMode);
+  $("#confirmCopy")?.classList.toggle("hidden", state.manualCopyMode);
+  $("#regenerateCopy")?.classList.toggle("hidden", state.manualCopyMode);
+  $("#syncSelectedCopy")?.classList.toggle("hidden", state.manualCopyMode);
+  $("#backToFullFlow")?.classList.toggle("hidden", !state.manualCopyMode);
+
   state.copyDrafts.forEach((draft, index) => {
     const card = document.createElement("article");
     card.className = "copy-card";
@@ -1476,6 +1657,21 @@ function renderCopyView() {
       syncEditedCopyToVoiceover(Number(button.dataset.syncCopy), button);
     });
   });
+}
+
+function renderManualCopySummary() {
+  const manual = collectManualCopyInput();
+  $("#manualCopySummary").innerHTML = [
+    ["模式", "我已有文案，直接生成脚本"],
+    ["产品", manual.productName || "未填写"],
+    ["国家/语言", `${manual.targetCountry || "未选"} / ${manual.outputLanguage || "未选"}`],
+    ["文案来源语言", manual.sourceLanguage || "未选"],
+  ]
+    .map(
+      ([label, value]) =>
+        `<div class="summary-item"><strong>${label}</strong><span>${escapeHtml(value)}</span></div>`
+    )
+    .join("");
 }
 
 function renderScriptSetup() {
@@ -1609,6 +1805,117 @@ function toScriptText(script) {
   ].join("\n");
 }
 
+const excelTableHeaders = [
+  "脚本编号",
+  "段落序号",
+  "文案编号",
+  "中文文案",
+  "目标语言文案",
+  "sora参考图prompt",
+  "sora prompt",
+  "veo参考图 prompt",
+  "veo参考图",
+  "veo prompt",
+];
+
+function buildExcelTableRows() {
+  syncVideoScriptsFromDom();
+  const selectedScripts = state.videoScripts.filter((script) => script.selected);
+  if (!selectedScripts.length) return [];
+
+  const isVeo = (state.selectedVideoModel || "").toLowerCase() === "veo";
+  const rows = [];
+
+  selectedScripts.forEach((script, scriptIndex) => {
+    (script.segments || []).forEach((segment) => {
+      const scriptNo = script.planNo || scriptIndex + 1;
+      rows.push([
+        scriptNo,
+        segment.segmentNo || 1,
+        scriptNo,
+        segment.segmentEditedZh || script.editedZh || "",
+        segment.segmentVoiceover || script.voiceover || "",
+        isVeo ? "" : segment.referencePrompt || "",
+        isVeo ? "" : segment.videoPrompt || "",
+        isVeo ? segment.referencePrompt || "" : "",
+        "",
+        isVeo ? segment.videoPrompt || "" : "",
+      ]);
+    });
+  });
+
+  return rows;
+}
+
+function buildExcelHtmlTable(rows) {
+  const head = excelTableHeaders.map((header) => `<th>${escapeHtml(header)}</th>`).join("");
+  const body = rows
+    .map(
+      (row) =>
+        `<tr>${row
+          .map((cell) => `<td style="mso-number-format:'\\@'; vertical-align:top; white-space:pre-wrap;">${escapeHtml(cell)}</td>`)
+          .join("")}</tr>`
+    )
+    .join("");
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      table { border-collapse: collapse; }
+      th, td { border: 1px solid #d9d9d9; padding: 6px; vertical-align: top; white-space: pre-wrap; }
+      th { background: #f5f7fa; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <table>
+      <thead><tr>${head}</tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+  </body>
+</html>`;
+}
+
+function exportExcelHtmlFile(filename, rows) {
+  const html = buildExcelHtmlTable(rows);
+  const blob = new Blob(["\ufeff", html], { type: "application/vnd.ms-excel;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function buildReadableScriptsText() {
+  syncVideoScriptsFromDom();
+  const selectedScripts = state.videoScripts.filter((script) => script.selected);
+  return selectedScripts.map((script) => toScriptText(script)).join("\n\n");
+}
+
+function exportSelectedScriptsAsExcelTable() {
+  const rows = buildExcelTableRows();
+  if (!rows.length) {
+    alert("请先勾选至少 1 条脚本并先生成结果。");
+    return;
+  }
+  const productName = String(state.productInput?.productName || "脚本提示词").replace(/[\\/:*?"<>|]/g, "").slice(0, 24);
+  exportExcelHtmlFile(`${productName || "脚本提示词"}-飞书表格版.xls`, rows);
+}
+
+async function copySelectedScriptsAsReadableText() {
+  const text = buildReadableScriptsText();
+  if (!text) {
+    alert("请先勾选至少 1 条脚本并先生成结果。");
+    return;
+  }
+  await copyText(text);
+  alert("已复制阅读版脚本。");
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -1623,10 +1930,11 @@ async function copyText(text) {
 }
 
 function renderCopySummary() {
+  const input = state.productInput || {};
   const selectedCount = state.copyDrafts.filter((draft) => draft.selected).length || state.copyDrafts.length;
   $("#copySummary").innerHTML = [
-    ["产品", state.productInput.productName],
-    ["国家/语言", `${state.productInput.targetCountry} / ${state.productInput.outputLanguage}`],
+    ["产品", input.productName || "未填写"],
+    ["国家/语言", `${input.targetCountry || "未选"} / ${input.outputLanguage || "未选"}`],
     ["文案数量", `${state.copyDrafts.length} 条`],
     ["默认保留", `${selectedCount} 条`],
   ]
@@ -1976,6 +2284,7 @@ function showCopy() {
   $("#stepCopy").classList.add("active");
   $("#stepScript").classList.remove("active");
   window.scrollTo({ top: 0, behavior: "smooth" });
+  renderManualCopySummary();
 }
 
 function showScript() {

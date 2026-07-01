@@ -22,6 +22,8 @@ const {
   SCRIPT_TABLE_NAME,
 } = require("./feishu");
 
+loadDotEnv();
+
 const PORT = Number(process.env.PORT || 4173);
 const AI_PROVIDER = (process.env.AI_PROVIDER || "openai").toLowerCase();
 const MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
@@ -32,6 +34,7 @@ const GEMINI_FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "")
   .filter(Boolean);
 const GEMINI_MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || 3);
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+const OPENAI_API_MODE = (process.env.OPENAI_API_MODE || "chat_completions").toLowerCase();
 const GEMINI_BASE_URL = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
 const API_RESPONSE_TIMEOUT_MS = Number(process.env.API_RESPONSE_TIMEOUT_MS || 180000);
 const PROXY_CONNECT_TIMEOUT_MS = Number(process.env.PROXY_CONNECT_TIMEOUT_MS || 30000);
@@ -77,6 +80,10 @@ const server = http.createServer(async (req, res) => {
       await handleCopy(req, res);
       return;
     }
+    if (req.method === "POST" && req.url === "/api/manual-copy") {
+      await handleManualCopy(req, res);
+      return;
+    }
     if (req.method === "POST" && req.url === "/api/sync-copy") {
       await handleSyncCopy(req, res);
       return;
@@ -107,6 +114,34 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`AI TikTok tool running at http://127.0.0.1:${PORT}`);
 });
+
+function loadDotEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) return;
+
+    const key = match[1];
+    if (process.env[key] != null) return;
+    process.env[key] = parseEnvValue(match[2]);
+  });
+}
+
+function parseEnvValue(value) {
+  const trimmed = String(value || "").trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
 
 async function handleLogin(req, res) {
   if (!isAuthEnabled()) {
@@ -194,6 +229,67 @@ async function handleCopy(req, res) {
   sendJson(res, 200, { copyDrafts: repairedDrafts });
 }
 
+async function handleManualCopy(req, res) {
+  const input = await readJsonBody(req);
+  const manualCopy = input.manualCopy || {};
+  const productInput = input.productInput || {};
+  const sourceCopy = String(manualCopy.sourceCopy || "").trim();
+
+  if (!sourceCopy) {
+    sendJson(res, 400, { error: "请先填写文案内容。" });
+    return;
+  }
+
+  if (process.env.MOCK_AI === "1") {
+    sendJson(res, 200, {
+      copyDrafts: createManualCopyDrafts({
+        manualCopy,
+        productInput,
+      }),
+    });
+    return;
+  }
+  if (!hasProviderKey()) {
+    sendJson(res, 500, { error: missingKeyMessage() });
+    return;
+  }
+
+  const result = await callModel({
+    system:
+      "你是跨境 TikTok 文案复用与本地化专家。必须只输出合法 JSON，不要 Markdown。你的任务是把用户已有文案整理成中文微调稿，同时生成目标国家语言的自然 TikTok 口播。",
+    user: buildManualCopyPrompt(input),
+    schemaName: "manual_copy_drafts",
+    schema: copySchema(1),
+  });
+  const repairedDrafts = await ensureChineseCopyDrafts(result.copyDrafts, {
+    productInput,
+    aiAnalysis: input.aiAnalysis || { planStrategies: [] },
+  });
+  sendJson(res, 200, { copyDrafts: repairedDrafts });
+}
+
+function createManualCopyDrafts(input) {
+  const productInput = input.productInput || {};
+  const manualCopy = input.manualCopy || {};
+  const sourceCopy = String(manualCopy.sourceCopy || "").trim();
+  const sourceLooksChinese = /中文|自动识别/i.test(manualCopy.sourceLanguage || "") || isMostlyChinese(sourceCopy);
+  const language = productInput.outputLanguage || "目标语言";
+  return [
+    {
+      planNo: 1,
+      style: "我已有文案",
+      audience: "已有文案复用",
+      duration: "20-30s",
+      hook: "直接复用已有文案",
+      voiceover: sourceLooksChinese ? `[${language}待同步] ${sourceCopy}` : sourceCopy,
+      voiceoverZh: sourceLooksChinese ? sourceCopy : `根据 ${productInput.targetCountry || "目标国家"} 和 ${productInput.outputLanguage || "目标语言"} 继续本地化。`,
+      editedZh: sourceLooksChinese ? sourceCopy : `根据 ${productInput.targetCountry || "目标国家"} 和 ${productInput.outputLanguage || "目标语言"} 继续本地化。`,
+      cta: "直接生成脚本",
+      selected: true,
+    },
+  ];
+}
+
 async function handleSyncCopy(req, res) {
   const input = await readJsonBody(req);
   if (process.env.MOCK_AI === "1") {
@@ -229,14 +325,26 @@ async function handleScript(req, res) {
   }
 
   const scriptCount = input.copyDrafts?.length || 1;
-  const result = await callModel({
-    system:
-      "你是 Sora/Veo AI 视频生成提示词专家。必须只输出合法 JSON，不要 Markdown。你的任务是把已确认口播文案转成 AI 视频脚本，包含中文结构化参考图 prompt 和中文结构化视频 prompt。",
-    user: buildScriptPrompt(input),
-    schemaName: "video_generation_scripts",
-    schema: scriptSchema(scriptCount),
-  });
-  sendJson(res, 200, { scripts: normalizeVideoScripts(result.scripts) });
+  try {
+    const result = await callModel({
+      system:
+        "你是 Sora/Veo AI 视频生成提示词专家。必须只输出合法 JSON，不要 Markdown。你的任务是把已确认口播文案转成 AI 视频脚本，包含中文结构化参考图 prompt 和中文结构化视频 prompt。",
+      user: buildScriptPrompt(input),
+      schemaName: "video_generation_scripts",
+      schema: scriptSchema(scriptCount),
+    });
+    sendJson(res, 200, { scripts: normalizeVideoScripts(result.scripts) });
+  } catch (error) {
+    if (isModelTimeoutLikeError(error)) {
+      console.warn("脚本模型超时，回退到本地模拟脚本：", error.message);
+      sendJson(res, 200, {
+        scripts: normalizeVideoScripts(createMockVideoScripts(input)),
+        warning: "脚本模型超时，已使用本地模拟脚本回退。",
+      });
+      return;
+    }
+    throw error;
+  }
 }
 
 async function handleFeishuExport(req, res) {
@@ -410,14 +518,23 @@ async function handleFeishuDiagnose(req, res) {
 
 function hasProviderKey() {
   if (AI_PROVIDER === "gemini") return Boolean(process.env.GEMINI_API_KEY);
-  return Boolean(process.env.OPENAI_API_KEY);
+  return Boolean(process.env.OPENAI_API_KEY) || !isOfficialOpenAIBaseUrl();
 }
 
 function missingKeyMessage() {
   if (AI_PROVIDER === "gemini") {
     return "缺少 GEMINI_API_KEY。请用 AI_PROVIDER=gemini GEMINI_API_KEY=你的key node server.js 启动。";
   }
-  return "缺少 OPENAI_API_KEY。请用 OPENAI_API_KEY=你的key node server.js 启动。";
+  return "缺少 OPENAI_API_KEY。官方 OpenAI 地址需要 key；如果你用免 key 中转，请在 .env 里设置 OPENAI_BASE_URL=你的中转/v1。";
+}
+
+function isOfficialOpenAIBaseUrl() {
+  try {
+    const host = new URL(OPENAI_BASE_URL).hostname.toLowerCase();
+    return host === "api.openai.com";
+  } catch {
+    return false;
+  }
 }
 
 function createMockAnalysis(input) {
@@ -660,12 +777,8 @@ function createMockVideoScripts(input) {
       tags: createMockVideoTags(input.productInput, draft),
       voiceover: draft.voiceover,
       editedZh: draft.editedZh,
-      segments: Array.from({ length: segmentCount }, (_, segmentIndex) => ({
-        segmentNo: segmentIndex + 1,
-        duration: segmentDuration,
-        referenceMode:
-          videoModel === "veo" ? "本段最多 3 张参考图，对应 3 个关键镜头。" : "本段使用 1 张拼图参考图，拼入 3-5 个关键画面。",
-        shots: Array.from({ length: videoModel === "veo" ? 3 : 4 }, (_, shotIndex) => {
+      segments: Array.from({ length: segmentCount }, (_, segmentIndex) => {
+        const shots = Array.from({ length: videoModel === "veo" ? 3 : 4 }, (_, shotIndex) => {
           const shotNo = shotIndex + 1;
           return {
             shotNo,
@@ -673,8 +786,35 @@ function createMockVideoScripts(input) {
             referenceImagePrompt: `【参考图编号】\n${modelName}-第 ${segmentIndex + 1} 段-第 ${shotNo} 镜头\n\n【画面主体】\n${input.productInput?.productName || "产品"} 在真实生活场景中出现，画面信息密度高，同时能看到产品、包装/配件、使用环境和人物动作；产品外观、颜色、形状、包装、图案和细节如产品参考图所示。\n\n【人物与动作】\n真实 TikTok 用户或老板/工厂人员，穿着日常，表情自然，正在展示产品，产品如图所示；如果是工厂/老板视角，老板拿着产品走向镜头，背景工人正在打包或搬纸箱，现场有真实忙碌感。\n\n【场景与本土化】\n普通家庭环境或工厂仓库打包区，通过衣柜、车内、洗手间、纸箱堆、包装台、工人动作等细节体现真实场景；产品摆放和使用方式如产品参考图所示。\n\n【画面风格】\n真实手机拍摄、TikTok UGC、自然光、不像广告大片；允许轻微手持晃动、自然杂乱和现场不完美。\n\n【构图】\n竖屏 9:16，中近景或手部特写；可以做拼图/多宫格参考，让包装、使用状态和效果对比同屏出现。\n\n【避免】\n不要夸张香味烟雾，不要产品变形，不要改变产品颜色/形状/包装，不要假，不要欧美豪宅背景。`,
             videoPrompt: `【模型】\n${modelName}\n\n【段落与镜头】\n第 ${segmentIndex + 1} 段，第 ${shotNo} 镜头，时长 ${Math.max(2, Math.round(segmentDuration / (videoModel === "veo" ? 3 : 4)))} 秒。\n\n【参考图】\n分镜图 ${shotNo}\n\n【动态内容】\n人物自然展示产品，画面和产品如分镜图 ${shotNo} 所示。\n\n【镜头运动】\n手持轻微晃动 / 慢推近 / 第一人称视角。\n\n【口播/字幕】\n${draft.voiceover}\n\n【风格】\n真实 TikTok UGC，本土生活感，手机拍摄。\n\n【约束】\n保持产品形状一致，画质风格接地气，不改变产品，不生成夸张，不加入无关人物，不出现乱码文字。`,
           };
-        }),
-      })),
+        });
+        return {
+          segmentNo: segmentIndex + 1,
+          duration: segmentDuration,
+          referenceCount: videoModel === "veo" ? 3 : 1,
+          segmentVoiceover: draft.voiceover,
+          segmentEditedZh: draft.editedZh,
+          referenceMode:
+            videoModel === "veo" ? "本段最多 3 张参考图，对应 3 个关键镜头。" : "本段使用 1 张拼图参考图，拼入 3-5 个关键画面。",
+          referencePrompt: [
+            `生成${videoModel === "veo" ? 3 : 1}张参考图。`,
+            "【画面风格】真实 TikTok UGC、自然光、本土生活感、手机拍摄。",
+            `【构图】竖屏 9:16，${videoModel === "veo" ? "不要拼图，每张参考图对应一个关键动作。" : "可用四宫格拼图，把产品、使用前后和人物动作同屏呈现。"}`,
+            "【避免】产品严格和参考图保持一致，不要做任何改变；不要产品变形，不要改变颜色/形状/包装，不要假 logo。",
+            ...shots.slice(0, videoModel === "veo" ? 3 : 1).map((shot, index) => `第${index + 1}张：${shot.referenceImagePrompt}`),
+          ].join("\n"),
+          videoPrompt: [
+            "【风格】真实 TikTok UGC，本土生活感，手机拍摄，自然手持感。",
+            `【镜头】第 ${segmentIndex + 1} 段共 ${shots.length} 个镜头，围绕 ${input.productInput?.productName || "产品"} 的真实使用过程展开。`,
+            "【约束】产品严格和参考图保持一致，不要做任何改变；不夸大功效，不添加无关人物，不出现乱码文字。",
+            ...shots.map((shot) =>
+              videoModel === "veo"
+                ? `镜头${shot.shotNo}：\n【参考图】第${Math.min(3, shot.shotNo)}张\n【动态内容】人物自然展示产品，画面和产品如参考图所示。\n【镜头运动】手持轻微晃动 / 慢推近 / 第一人称视角。\n【${input.productInput?.outputLanguage || "目标语言"}台词】${draft.voiceover}`
+                : `镜头${shot.shotNo}：\n【动态内容】人物自然展示产品，画面和产品如拼图参考图所示。\n【镜头运动】手持轻微晃动 / 慢推近 / 第一人称视角。\n【${input.productInput?.outputLanguage || "目标语言"}台词】${draft.voiceover}`
+            ),
+          ].join("\n"),
+          shots,
+        };
+      }),
     };
   });
 }
@@ -717,6 +857,70 @@ async function callModel({ system, user, schemaName, schema }) {
 }
 
 async function callOpenAI({ system, user, schemaName, schema }) {
+  if (OPENAI_API_MODE === "responses") {
+    return callOpenAIResponses({ system, user, schemaName, schema });
+  }
+  return callOpenAIChatCompletions({ system, user, schemaName, schema });
+}
+
+async function callOpenAIChatCompletions({ system, user, schemaName, schema }) {
+  const payload = {
+    model: MODEL,
+    messages: [
+      {
+        role: "system",
+        content: system,
+      },
+      {
+        role: "user",
+        content: [
+          user,
+          "",
+          `请严格输出符合这个 JSON schema 的 JSON 对象，顶层 schema 名称：${schemaName}。`,
+          JSON.stringify(schema, null, 2),
+        ].join("\n"),
+      },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+  };
+
+  let response;
+  const url = `${OPENAI_BASE_URL}/chat/completions`;
+  try {
+    response = await requestOpenAI(url, payload);
+  } catch (error) {
+    throw new Error(
+      [
+        "无法连接 OpenAI 兼容接口。",
+        `请求地址：${url}`,
+        "这通常是网络、VPN、代理或中转地址配置问题。",
+        `底层错误：${error.message}`,
+      ].join("\n")
+    );
+  }
+
+  const data = await readJsonResponseSafely(response, "OpenAI");
+  if (!response.ok) {
+    throw new Error(extractApiErrorMessage(data, response.status, "OpenAI"));
+  }
+
+  const text = data.choices?.[0]?.message?.content || "";
+  if (!text) throw new Error("OpenAI 兼容接口没有返回可解析内容");
+  try {
+    return parseModelJson(stripJsonCodeFence(text));
+  } catch (error) {
+    throw new Error(
+      [
+        "OpenAI 兼容接口返回的内容不是合法 JSON。",
+        `模型返回前 200 字：${String(text || "").slice(0, 200) || "空"}`,
+        `底层错误：${error.message}`,
+      ].join("\n")
+    );
+  }
+}
+
+async function callOpenAIResponses({ system, user, schemaName, schema }) {
   const payload = {
     model: MODEL,
     input: [
@@ -740,13 +944,14 @@ async function callOpenAI({ system, user, schemaName, schema }) {
   };
 
   let response;
+  const url = `${OPENAI_BASE_URL}/responses`;
   try {
-    response = await requestOpenAI(`${OPENAI_BASE_URL}/responses`, payload);
+    response = await requestOpenAI(url, payload);
   } catch (error) {
     throw new Error(
       [
         "无法连接 OpenAI API。",
-        `请求地址：${OPENAI_BASE_URL}/responses`,
+        `请求地址：${url}`,
         "这通常是网络、VPN、代理或中转地址配置问题。",
         "如果你在本机使用代理，请确认启动 Node 服务的终端也能访问 api.openai.com；或设置 OPENAI_BASE_URL 为可访问的 OpenAI 兼容地址。",
         `底层错误：${error.message}`,
@@ -886,9 +1091,11 @@ async function requestOpenAI(url, payload) {
   const proxyUrl = getProxyUrl();
   const body = JSON.stringify(payload);
   const headers = {
-    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     "Content-Type": "application/json",
   };
+  if (process.env.OPENAI_API_KEY) {
+    headers.Authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
+  }
 
   if (proxyUrl) {
     return requestJsonThroughHttpProxy(url, proxyUrl, headers, body);
@@ -1086,6 +1293,11 @@ function extractApiErrorMessage(data, status, providerName) {
     return `${providerName} 上游网关超时（HTTP 524）。通常是模型接口、中转地址或代理超时，不是脚本生成逻辑错误。请稍后重试，或检查 OPENAI_BASE_URL / 代理配置。`;
   }
   return normalized || `${providerName} API request failed (HTTP ${status || "unknown"})`;
+}
+
+function isModelTimeoutLikeError(error) {
+  const message = String(error?.message || error || "");
+  return /524|超时|timeout|gateway|网关|非 JSON 响应/i.test(message);
 }
 
 function decodeChunkedBody(buffer) {
@@ -1357,6 +1569,35 @@ function buildSyncCopyPrompt(input) {
   );
 }
 
+function buildManualCopyPrompt(input) {
+  const productInput = input.productInput || {};
+  const manualCopy = input.manualCopy || {};
+  return JSON.stringify(
+    {
+      task: "整理用户已有文案，保留原意，同时输出中文微调稿和目标语言口播。",
+      requirements: [
+        "voiceover 必须是 productInput.outputLanguage 对应的目标语言口播，不能继续输出中文，除非目标语言本身就是中文。",
+        "voiceoverZh 和 editedZh 必须是自然简体中文，用来给用户确认和后续脚本理解。",
+        "如果用户输入的是中文，先保留为 editedZh，再本地化翻译成目标语言 voiceover。",
+        "如果用户输入的是目标语言，voiceover 保留并轻微润色，editedZh 翻译/整理成中文。",
+        "不要重新做卖点分析，不要补充新的产品能力，不要扩写成完整销售页。",
+        "保留原文案的开头、卖点顺序、CTA 和情绪强度，必要时只做轻微润色。",
+        "如果目标国家是马来西亚且输出语言是马来语，voiceover 必须使用自然马来语/马来西亚 TikTok 口语，不要输出中文。",
+        "输出内容要简洁，适合直接进入脚本生成。",
+      ],
+      context: {
+        productName: productInput.productName || "",
+        targetCountry: productInput.targetCountry || "",
+        outputLanguage: productInput.outputLanguage || "",
+        sourceLanguage: manualCopy.sourceLanguage || "",
+      },
+      sourceCopy: manualCopy.sourceCopy || "",
+    },
+    null,
+    2
+  );
+}
+
 function buildScriptPrompt(input) {
   const productInput = input.productInput || {};
   const draft = Array.isArray(input.copyDrafts) ? input.copyDrafts[0] || {} : input.copyDrafts || {};
@@ -1378,19 +1619,20 @@ function buildScriptPrompt(input) {
       task: "根据最终保留的口播文案，生成给 Sora/Veo 使用的 AI 视频脚本提示词。",
       modelRules: {
         selectedModel: input.videoModel,
-        sora: "每段视频最长 12 秒；每段默认 1 张参考图，只有信息密度明显不足时再补充。",
+        sora: "每段视频最长 12 秒；每段默认 1 张参考图，允许四宫格拼图，但产品图必须一致。",
         veo: "每段视频最长 10 秒；每段可使用 1-3 张参考图。",
-        segmentation: "必须先判断目标语言口播长度，再按自然停顿和句意拆段，任何一段都不能超过模型单段视频时长上限。",
+        segmentation: "必须先判断目标语言口播长度，再按自然停顿和句意拆段。任何一段都不能超过模型单段视频时长上限，但在不超时的前提下要尽量少分段，能合并成 1 段就不要拆成 2 段，能合并成 2 段就不要拆成 3 段。",
         shotsPerSegment: "每段控制在 2-4 个镜头说明，按段输出，不要每个镜头单独生成一份完整 prompt。",
         referenceCount: "Sora 每段默认 1 张；Veo 每段 1-3 张，按该段信息量决定。",
       },
       visualRules: [
+        "参考图和视频 prompt 都必须加入“避免：产品严格和参考图保持一致，不要做任何改变”。",
         "参考图 prompt 要提高画面信息密度：不要只有单一产品大图，画面中应同时包含产品、包装/配件/使用前后状态、人物动作、场景背景、真实生活或工作环境细节。",
         "productInput.rawCoreSellingPoints 是必须在视频中真实呈现的点，生成参考图和视频 prompt 时必须逐段落实到画面、动作、前后对比、使用状态或场景细节里，不能只停留在口播里。",
         "画面真实感优先：模拟手机拍摄、普通人/工厂/仓库/家庭环境、自然杂乱、轻微不完美，不要像棚拍广告大片。",
         "如果方案风格是“工厂/老板视角”，画面应优先包含工厂打包现场、堆叠纸箱、工人操作、老板/厂长拿产品口播、真实小插曲或忙碌背景，让用户感觉正在看到源头现场。",
         "工厂/老板视角可以使用戏剧化但真实的场面调度，例如老板边走边介绍、工人打包、背景有人争论、产品包装/使用效果同屏展示，但不要过度夸张或像影视片。",
-        "分镜图可以描述多宫格/拼图参考：例如左边包装，中间正常光线使用效果，右边暗光/对比效果；但产品外观必须如产品参考图所示。",
+        "Veo 参考图不要用拼接拼图的方式；Sora 可以用四宫格拼图，但产品图一样要保持一致。",
       ],
       factoryBossStyleReference: {
         structure:
@@ -1404,14 +1646,17 @@ function buildScriptPrompt(input) {
         "参考图 prompt 必须一段一个，不要一个镜头一个。",
         "开头先写：生成X张参考图。",
         "然后固定输出【画面风格】【构图】【避免】。",
+        "避免必须包含：产品严格和参考图保持一致，不要做任何改变。",
         "接着按顺序写：第1张：... 第2张：... 第3张：...",
         "每一张都要明确这一张里呈现的产品状态、人物动作、场景、以及这一张负责承接的必须视频呈现点。",
       ],
       videoPromptFormat: [
         "视频 prompt 必须一段一个，不要按镜头拆成多份 prompt。",
         "开头固定输出【风格】【镜头】【约束】。",
-        "Veo 的镜头按顺序写：镜头1：{【参考图】【动态内容】【镜头运动】【口播/字幕】}，镜头2：...",
-        "Sora 因为每段通常只有 1 张参考图，所以镜头里不要重复写【参考图】字段，只写【动态内容】【镜头运动】【口播/字幕】。",
+        "避免必须包含：产品严格和参考图保持一致，不要做任何改变。",
+        "Veo 的镜头按顺序写：镜头1：{【参考图】【：第几张】【动态内容】【镜头运动】【口播/字幕】}，镜头2：...；参考图只写对应第几张，不要写拼图。",
+        "Sora 可用四宫格拼图参考图，但产品图必须保持一致。",
+        "如果是马来西亚，口播和标题都要标注为【马来语口播/标题】；其他国家也要按对应国家语言标注。",
         "为了后续复制到飞书表格里更易读，每个镜头块必须换行书写，不要把镜头1、镜头2压成一整长行。",
         "镜头里的口播/字幕必须只使用该段对应的目标语言文案片段，不要把整条口播重复塞进每个镜头。",
       ],
@@ -1421,10 +1666,13 @@ function buildScriptPrompt(input) {
         "tags 要覆盖产品、场景、风格或购买动机，避免无关热词堆砌。",
       ],
       titleAndTagRules: [
-        "每条脚本必须生成 videoTitle：使用 productInput.outputLanguage 对应语言，适合目标国家 TikTok 用户，能制造好奇或利益点，吸引用户继续看。",
+        "每条脚本必须生成 videoTitle：使用 productInput.outputLanguage 对应语言，标题前要带对应国家语言标签，例如【马来语口播/标题】。",
         "videoTitle 不要用生硬国籍标签假装本土化，不要虚假承诺，不要夸张医疗/除菌效果。",
         "每条脚本必须生成 tags：3-5 个当地 TikTok 可用 tag，可包含 #TikTokShop、产品类目、使用场景、风格或购买动机。",
         "tags 要服务于搜索和转化，不要堆无关热门词。",
+        "标题和口播都必须带对应国家语言标签意识，例如【马来语口播/标题】、【英文台词】。",
+        "不同方案脚本必须尽量保证：切入人群不同、痛点不同、开头不同；开头可以是画面、价格便宜、促销、悬念、痛点等多种方式。",
+        "不同方案之间不要撞车，必须结合脑图里的共鸣、好奇、恐惧/避坑、向往、满足等开头方式错开。",
       ],
       currentScriptOnly: {
         planNo,
@@ -1432,16 +1680,19 @@ function buildScriptPrompt(input) {
         productName: productInput.productName || "",
         targetCountry: productInput.targetCountry || "",
         outputLanguage: productInput.outputLanguage || "",
+        languageLabel: `${productInput.outputLanguage || "目标语言"}口播/标题`,
         style: draft.style || plan.style || "",
         audience: draft.audience || plan.audience || "",
         hookType: plan.hookType || "",
         openingSummary: plan.openingSummary || "",
         openingDetail: plan.openingDetail || "",
+        openingReason: plan.stayReason || "",
         sceneHint: plan.sceneHint || "",
         requiredCoreSellingPoints,
         supplementalSellingPoints,
         voiceover: draft.voiceover || "",
         editedZh: draft.editedZh || "",
+        manualCopyMode: Boolean(input.manualCopyMode),
       },
     },
     null,
